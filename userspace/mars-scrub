@@ -1,0 +1,106 @@
+#!/usr/bin/perl
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Offline replica comparison only: no writes, repair, or online consistency claim.
+use strict;
+use warnings;
+use Digest::SHA qw(sha256_hex);
+use Fcntl qw(O_RDONLY O_NONBLOCK S_ISREG S_ISBLK);
+use Getopt::Long qw(GetOptionsFromArray);
+use JSON::PP;
+use Errno qw(EINTR);
+
+sub mars_scrub_read_exact {
+    my ($fh, $length) = @_;
+    my $buffer = '';
+    while (length($buffer) < $length) {
+        my $read = sysread($fh, $buffer, $length - length($buffer), length($buffer));
+        if (!defined $read) {
+            next if $! == EINTR;
+            die "read failed: $!\n";
+        }
+        die "unexpected end of input (short read)\n" if $read == 0;
+    }
+    return $buffer;
+}
+
+sub mars_scrub_size {
+    my ($fh) = @_;
+    my @stat = stat($fh);
+    die "cannot stat input: $!\n" unless @stat;
+    return $stat[7] if S_ISREG($stat[2]);
+    if (S_ISBLK($stat[2])) {
+        # Linux BLKGETSIZE64: return byte capacity in an unsigned 64-bit value.
+        my $size = pack('Q', 0);
+        ioctl($fh, 0x80081272, $size) or die "BLKGETSIZE64 failed: $!\n";
+        return unpack('Q', $size);
+    }
+    die "inputs must be regular files or Linux block devices\n";
+}
+
+sub mars_scrub_main {
+    my @arguments = @_;
+    my ($quiescent, $help);
+    my $chunk = 1024 * 1024;
+    my $limit = 1024;
+    my %result = (schema_version => 1, algorithm => 'sha256', mismatch_count => 0,
+                  compared_bytes => 0, mismatches => []);
+    my $status = 2;
+    eval {
+        GetOptionsFromArray(\@arguments, 'quiescent' => \$quiescent, 'help' => \$help,
+                            'chunk-bytes=i' => \$chunk, 'max-records=i' => \$limit)
+            or die "invalid options\n";
+        if ($help) {
+            print "usage: mars-scrub --quiescent [--chunk-bytes N] [--max-records N] LEFT RIGHT\n";
+            print "Read-only offline comparison; detach/quiesce both replicas first.\n";
+            return 0;
+        }
+        die "--quiescent is required: detach/quiesce both inputs before comparing\n" unless $quiescent;
+        die "exactly two paths are required\n" unless @arguments == 2;
+        die "chunk-bytes must be between 512 and 16777216\n" if $chunk < 512 || $chunk > 16777216;
+        die "max-records must be between 0 and 100000\n" if $limit < 0 || $limit > 100000;
+        $result{left} = $arguments[0];
+        $result{right} = $arguments[1];
+        $result{chunk_bytes} = $chunk;
+        sysopen(my $left, $arguments[0], O_RDONLY | O_NONBLOCK) or die "open left: $!\n";
+        sysopen(my $right, $arguments[1], O_RDONLY | O_NONBLOCK) or die "open right: $!\n";
+        my $size = mars_scrub_size($left);
+        my $right_size = mars_scrub_size($right);
+        die "input sizes differ ($size != $right_size)\n" if $size != $right_size;
+        my @left_stat = stat($left);
+        my @right_stat = stat($right);
+        die "inputs refer to the same object\n"
+            if ($left_stat[0] == $right_stat[0] && $left_stat[1] == $right_stat[1]) ||
+               (S_ISBLK($left_stat[2]) && S_ISBLK($right_stat[2]) && $left_stat[6] == $right_stat[6]);
+        $result{size_bytes} = $size;
+        for (my $offset = 0; $offset < $size; $offset += $chunk) {
+            my $length = $size - $offset < $chunk ? $size - $offset : $chunk;
+            my $a = sha256_hex(mars_scrub_read_exact($left, $length));
+            my $b = sha256_hex(mars_scrub_read_exact($right, $length));
+            if ($a ne $b) {
+                $result{mismatch_count}++;
+                push @{$result{mismatches}}, {offset_bytes => $offset, length_bytes => $length,
+                    left_sha256 => $a, right_sha256 => $b} if @{$result{mismatches}} < $limit;
+            }
+            $result{compared_bytes} += $length;
+        }
+        die "input size changed during comparison\n"
+            if mars_scrub_size($left) != $size || mars_scrub_size($right) != $size;
+        close $left or die "close left: $!\n";
+        close $right or die "close right: $!\n";
+        $result{omitted_mismatches} = $result{mismatch_count} - @{$result{mismatches}};
+        $result{equal} = $result{mismatch_count} ? JSON::PP::false : JSON::PP::true;
+        $status = $result{mismatch_count} ? 1 : 0;
+    };
+    return 0 if $help && !$@;
+    if ($@) {
+        my $error = $@;
+        chomp $error;
+        $result{error} = $error;
+        $status = 2;
+    }
+    print JSON::PP->new->canonical->encode(\%result), "\n";
+    return $status;
+}
+
+exit mars_scrub_main(@ARGV) unless caller;
+1;

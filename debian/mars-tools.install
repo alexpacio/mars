@@ -1,1 +1,4 @@
 userspace/marsadm usr/sbin
+userspace/udev/65-mars.rules usr/lib/udev/rules.d
+userspace/mars-status usr/sbin
+userspace/mars-scrub usr/sbin

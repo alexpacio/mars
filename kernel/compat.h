@@ -27,8 +27,8 @@
 #include <linux/major.h>
 #include <linux/version.h>
 
-/* Linux 7.2+ uses kernel-buffer VFS APIs and bio-based gendisks. */
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 2, 0)
+/* Supported modern kernels use kernel-buffer VFS APIs and bio-based disks. */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 0)
 #define MARS_MODERN_KERNEL
 #include <linux/sched/clock.h>
 #endif

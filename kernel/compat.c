@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-/* Kernel-buffer VFS operations for Linux 7.2 and later. */
+/* Kernel-buffer VFS operations for Linux 6.18 and later. */
 #include <linux/fs.h>
 #include <linux/namei.h>
 #include <linux/mount.h>
@@ -44,11 +44,15 @@ int _compat_symlink(const char *target, const char *name,
 #ifdef scoped_with_init_fs
 	CLASS(__override_init_fs, init_fs)();
 #endif
-	dentry = start_creating_path(AT_FDCWD, name, &path, 0);
+	dentry = start_creating_path(AT_FDCWD, name, &path, LOOKUP_NO_SYMLINKS);
 	if (IS_ERR(dentry))
 		return PTR_ERR(dentry);
 	err = vfs_symlink(mnt_idmap(path.mnt), d_inode(path.dentry),
-			  dentry, target, NULL);
+			  dentry, target
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 1, 0)
+			  , NULL
+#endif
+			  );
 	if (!err && mtime) {
 		struct iattr attr = {
 			.ia_valid = ATTR_MTIME | ATTR_MTIME_SET | ATTR_TIMES_SET,
@@ -72,11 +76,16 @@ int _compat_mkdir(const char *name, int mode)
 #ifdef scoped_with_init_fs
 	CLASS(__override_init_fs, init_fs)();
 #endif
-	dentry = start_creating_path(AT_FDCWD, name, &path, LOOKUP_DIRECTORY);
+	dentry = start_creating_path(AT_FDCWD, name, &path,
+				     LOOKUP_DIRECTORY | LOOKUP_NO_SYMLINKS);
 	if (IS_ERR(dentry))
 		return PTR_ERR(dentry);
 	dentry = vfs_mkdir(mnt_idmap(path.mnt), d_inode(path.dentry),
-			    dentry, mode, NULL);
+			    dentry, mode
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 1, 0)
+			    , NULL
+#endif
+			    );
 	err = IS_ERR(dentry) ? PTR_ERR(dentry) : 0;
 	end_creating_path(&path, dentry);
 	return err;
@@ -98,7 +107,7 @@ static int mars_parent_path(const char *name, struct path *parent,
 	dirname = kstrndup(name, slash == name ? 1 : slash - name, GFP_NOFS);
 	if (!dirname)
 		return -ENOMEM;
-	err = mars_kern_path(dirname, LOOKUP_DIRECTORY | LOOKUP_FOLLOW, parent);
+	err = mars_kern_path(dirname, LOOKUP_DIRECTORY | LOOKUP_NO_SYMLINKS, parent);
 	kfree(dirname);
 	return err;
 }
@@ -115,14 +124,26 @@ int _compat_unlink(const char *name)
 	err = mnt_want_write(path.mnt);
 	if (err)
 		goto out;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 1, 0)
 	dentry = start_removing(mnt_idmap(path.mnt), path.dentry, &last);
+#else
+	inode_lock(d_inode(path.dentry));
+	dentry = lookup_one(mnt_idmap(path.mnt), &last, path.dentry);
+#endif
 	if (IS_ERR(dentry)) {
 		err = PTR_ERR(dentry);
 	} else {
 		err = vfs_unlink(mnt_idmap(path.mnt), d_inode(path.dentry),
 				 dentry, NULL);
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 1, 0)
 		end_removing(dentry);
+#else
+		dput(dentry);
+#endif
 	}
+#if LINUX_VERSION_CODE < KERNEL_VERSION(7, 1, 0)
+	inode_unlock(d_inode(path.dentry));
+#endif
 	mnt_drop_write(path.mnt);
 out:
 	path_put(&path);
@@ -150,11 +171,40 @@ int _compat_rename(const char *oldname, const char *newname)
 	rd.mnt_idmap = mnt_idmap(oldpath.mnt);
 	rd.old_parent = oldpath.dentry;
 	rd.new_parent = newpath.dentry;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 1, 0)
 	err = start_renaming(&rd, 0, &oldlast, &newlast);
 	if (!err) {
 		err = vfs_rename(&rd);
 		end_renaming(&rd);
 	}
+#else
+	{
+		struct dentry *trap = lock_rename(newpath.dentry, oldpath.dentry);
+
+		rd.old_dentry = lookup_one(rd.mnt_idmap, &oldlast, oldpath.dentry);
+		if (IS_ERR(rd.old_dentry)) {
+			err = PTR_ERR(rd.old_dentry);
+			goto unlock;
+		}
+		err = -ENOENT;
+		if (d_is_negative(rd.old_dentry))
+			goto put_old;
+		err = -EINVAL;
+		if (rd.old_dentry == trap)
+			goto put_old;
+		rd.new_dentry = lookup_one(rd.mnt_idmap, &newlast, newpath.dentry);
+		if (IS_ERR(rd.new_dentry)) {
+			err = PTR_ERR(rd.new_dentry);
+			goto put_old;
+		}
+		err = rd.new_dentry == trap ? -ENOTEMPTY : vfs_rename(&rd);
+		dput(rd.new_dentry);
+	put_old:
+		dput(rd.old_dentry);
+	unlock:
+		unlock_rename(newpath.dentry, oldpath.dentry);
+	}
+#endif
 	mnt_drop_write(oldpath.mnt);
 out_new:
 	path_put(&newpath);

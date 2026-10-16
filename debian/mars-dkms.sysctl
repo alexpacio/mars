@@ -1,2 +1,0 @@
-# System wide maximum number of asynchronous input/output requests
-fs.aio-max-nr = 1048576

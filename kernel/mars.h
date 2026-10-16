@@ -180,6 +180,7 @@ enum _MREF_FLAGS {
 	_MREF_MAY_WRITE,
 	_MREF_SKIP_SYNC,
 	_MREF_NODATA, /* only useful for chksum reading */
+	_MREF_DISCARD, /* zero payload with an optional backing deallocation hint */
 	/* Checksum bits, starting at the upper half */
 	_MREF_CHKSUM_MD5_OLD = 16,
 	_MREF_CHKSUM_MD5,
@@ -200,6 +201,7 @@ enum _MREF_FLAGS {
 #define MREF_MAY_WRITE       (1UL << _MREF_MAY_WRITE)
 #define MREF_SKIP_SYNC       (1UL << _MREF_SKIP_SYNC)
 #define MREF_NODATA          (1UL << _MREF_NODATA)
+#define MREF_DISCARD         (1UL << _MREF_DISCARD)
 #define MREF_CHKSUM_MD5_OLD  (1UL << _MREF_CHKSUM_MD5_OLD)
 #define MREF_CHKSUM_MD5      (1UL << _MREF_CHKSUM_MD5)
 #define MREF_CHKSUM_CRC32C   (1UL << _MREF_CHKSUM_CRC32C)
@@ -218,6 +220,7 @@ enum _MREF_FLAGS {
 				 MREF_MAY_WRITE |		\
 				 MREF_SKIP_SYNC |		\
 				 MREF_NODATA |			\
+				 MREF_DISCARD |			\
 				 0)
 
 #define MREF_CHKSUM_ANY      (MREF_CHKSUM_MD5_OLD |	\
@@ -304,6 +307,15 @@ struct mars_info {
 	loff_t current_size;
 	int tf_align;    // transfer alignment constraint
 	int tf_min_size; // transfer is only possible in multiples of this
+	/* Protocol 3 filters these fields when talking to older peers. */
+	int xf_physical_block_size;
+	int xf_logical_block_size;
+	int xf_alignment_offset;
+	int xf_io_min;
+	int xf_io_opt;
+	int xf_discard_enabled;
+	int xf_write_same_capable;
+	int xf_nonrot;
 };
 
 // brick stuff

@@ -1,68 +1,92 @@
-MARS on Linux 7.2 / 7.3 in QEMU microvm
-======================================
+MARS modern-kernel QEMU tests
+============================
 
-Run from the repository root, without root privileges:
+Run from the repository root without root privileges. Substitute installed
+kernel releases, each with /lib/modules/<release>/{build,vmlinuz} and its
+module tree. The configured build tree must include Module.symvers.
 
     python3 test_suite/qemu/run.py 7.2.9-2-cachyos
-    python3 test_suite/qemu/run.py 7.3.0-rc6-2-cachyos-rc
+    python3 test_suite/qemu/run.py 6.18.55-2-cachyos-lts --logical-block-size 4096
+    python3 test_suite/qemu/run.py 7.3.0-rc6-2-cachyos-rc --no-discard
+    MARS_DEBUG=y MARS_DEBUG_MEM=y python3 test_suite/qemu/run.py 7.2.9-2-cachyos
     python3 test_suite/qemu/replicate.py 7.2.9-2-cachyos 7.3.0-rc6-2-cachyos-rc
-    python3 test_suite/qemu/replicate.py 7.3.0-rc6-2-cachyos-rc 7.2.9-2-cachyos
+    python3 test_suite/qemu/replicate.py 7.3.0-rc6-2-cachyos-rc 7.1.5-arch1-2
+    python3 test_suite/qemu/crash.py 7.2.9-2-cachyos
 
-Substitute the exact installed kernel releases to test another build. Each
-kernel needs /lib/modules/<release>/build, vmlinuz, and its module tree.
-The build directory must contain the kernel configuration and Module.symvers.
-Match the kernel's toolchain: the runner selects LLVM=1 for Clang kernels.
+Host prerequisites: x86-64 Linux, Python 3, QEMU with microvm and KVM,
+make, matching compiler/binutils or LLVM, Perl/core modules, cpio, gzip,
+kmod, e2fsprogs, iproute2, util-linux (including blkdiscard/fstrim), GNU
+coreutils, bash, grep, sed, awk, findutils and pstree. Fault/crash tests also
+need dmsetup. WireGuard tests need wg. These tools are copied into the
+initramfs; no host module installation, TAP, sudo or host block disk is used.
+The runner selects LLVM=1 for kernels configured with Clang.
 
-Host prerequisites: x86-64 Linux, Python 3, QEMU system x86-64 with microvm,
-KVM access, make, the matching C compiler/binutils or LLVM, Perl and its core
-modules, cpio, gzip, kmod, e2fsprogs, iproute2, util-linux, GNU coreutils,
-bash, grep, sed, awk, findutils and pstree. No downloaded guest distribution,
-host module installation, TAP device, sudo or host block device is used.
 The target kernel needs modules, initramfs/gzip, devtmpfs, procfs, sysfs,
-ext4, virtio-mmio/block/net, IPv4/TCP, sysctl and the MARS crypto dependencies.
+tracefs, ext4, virtio-mmio/block/net, IPv4/TCP, sysctl and MARS dependencies.
+Additional test modules and binaries can be included using repeatable
+--extra-module and --extra-binary arguments. Configure prepared CI kernels
+with test_suite/ci/configure-kernel.sh. The single-node runner supports
+--accel tcg without KVM; allow longer timeouts for software emulation.
 
-The single-node runner also supports --accel tcg when KVM is unavailable
-(increase --timeout for software emulation). Replication uses KVM. Each guest
-has 2 vCPUs and 2 GiB RAM. Each run creates a sparse 32 GiB metadata image
-and a 128 MiB backing disk. Two-node tests create one pair per guest.
---workdir accepts a new directory; otherwise a temporary directory is used.
-Artifacts are retained at the printed path, including build.log, console.log,
-command.json, mars.ko under source/kernel/, initramfs, and disk images.
-Remove that directory after inspection to reclaim the space.
+Each guest has 2 vCPUs, 2 GiB RAM, a sparse 32 GiB metadata image and a
+128 MiB data image. Images live under /var/tmp by default; TMPDIR overrides
+that location. A RAM-backed /tmp can fill after a few runs. --workdir accepts
+a new directory. Logs, sources, initramfs and disk images are retained at
+the printed path; remove them after inspection to reclaim space.
+--prepare-only builds artifacts without booting QEMU. --module-source uses
+an alternate module source tree while retaining the current guest tools.
 
-QEMU directly boots the selected vmlinuz and generated initramfs with the
-microvm machine. ACPI is disabled, the RTC supplies cluster timestamps, and
-isa-debug-exit terminates the test without depending on firmware shutdown.
-The single-node test uses QEMU user networking. The replication test joins
-two virtual NICs over a private localhost socket and bootstraps only their
-cluster UUID/IP records; resource metadata and data travel through MARS TCP.
+Single-node coverage includes module load, resource creation, capacity and
+logical/physical sector sizes, durable writes/direct reads, discard and
+WRITE_ZEROES, overlapping rewrites, adjacent-data preservation, invalid
+ranges, native discard or fallback trace events, demotion/detach/unload,
+backing-device comparison, reload, ext4, file fsync and fstrim. Readback of
+native discarded sectors is checked against QEMU's zero-returning backend;
+this is not a general promise about reads following DISCARD.
 
-Single-node coverage:
-  - Build/link, module load, sysctl registration and Lamport clock access.
-  - Cluster/resource creation and exported disk capacity.
-  - Random writes with fsync, direct reads, byte comparison, demotion,
-    detach, unload, and comparison against the backing device.
-  - Reload, promotion, ext4 format/mount, fsynced file write, unmount,
-    detach/unload, and read-only verification on the backing filesystem.
+Two-node tests use a private QEMU socket Ethernet link. They bootstrap UUID
+and node IP records, then exercise native metadata exchange, resource join,
+full initial sync, log shipping, discard/overwrite/WRITE_ZEROES and direct
+secondary backing verification. The isolated guests explicitly enable
+mars_allow_insecure; deployed networking should use WireGuard. To verify
+old-reader fallback with a separate pre-change checkout/archive:
 
-Two-node coverage:
-  - Metadata exchange, resource join and full 128 MiB initial synchronization.
-  - A new 1 MiB pattern written after initial sync, transaction-log shipping
-    and replay, then direct comparison on the secondary backing device.
+    python3 test_suite/qemu/replicate.py PRIMARY_KERNEL SECONDARY_KERNEL \
+        --secondary-source /path/to/pre-change-source
 
-The runners fail on timeouts, guest failures, kernel warnings/oops/panics or
-missing success markers. The pair is terminated after replication succeeds;
-graceful demotion and unload are covered by the single-node runner.
---prepare-only on run.py builds the artifacts without starting QEMU.
+The pre-change module uses its legacy parameters on the secondary. Commit
+87ac5140 was tested this way against the new primary: protocol negotiation
+and zero-write replay of discard records passed. This is a rolling-upgrade
+compatibility check, not a claim that the old module has the new fixes.
 
-Validation uses the default MARS configuration on the named CachyOS kernels,
-not an upstream vanilla build. These are functional compatibility tests;
-they do not measure sustained throughput, simulate power loss, or cover
-every debug configuration and legacy kernel.
+crash.py gives the data backend a 60-second dm-delay while logs use a
+separate device. It waits for write/discard/overwrite acknowledgment,
+asserts the backing data is still stale, SIGKILLs QEMU, then reboots the
+same images with an undelayed backend. Recovery must reproduce the expected
+bytes both through MARS and on the backing device after detach/unload.
+There is no guest sync or graceful shutdown at the crash point. This tests
+guest crash recovery, not loss of the host's physical drive cache.
 
-Verified on 2026-10-14 with QEMU 11.1.2/KVM and Clang 23.1.1:
+Storage and protocol failure fixtures:
 
-    7.2.9-2-cachyos                 single-node + ext4: PASS
-    7.3.0-rc6-2-cachyos-rc          single-node + ext4: PASS
-    7.2.9 -> 7.3.0-rc6             initial sync + log replay: PASS
-    7.3.0-rc6 -> 7.2.9             initial sync + log replay: PASS
+    python3 test_suite/qemu/run.py KERNEL --guest-script test_suite/qemu/faults.sh \
+        --extra-module dm_mod --extra-binary dmsetup
+    python3 test_suite/qemu/run.py KERNEL --guest-script test_suite/qemu/faults.sh \
+        --extra-module dm_mod --extra-binary dmsetup --append mars_fault=log
+    python3 test_suite/qemu/run.py KERNEL --guest-script test_suite/qemu/network.sh
+    python3 test_suite/qemu/run.py KERNEL --guest-script test_suite/qemu/wireguard.sh \
+        --extra-module wireguard --extra-binary wg
+
+The dm-error fixtures verify first-error latching, failed subsequent writes,
+preserved replay positions and unload after data/log failures. The network
+fixture sends malformed descriptors, strings, paths and callbacks, tests
+export policy, IPv6 and reloads. WireGuard creates a peer network namespace
+inside the guest, exchanges encrypted commands in both directions, checks
+source binding, and rejects a local plaintext bypass. It does not exercise
+two complete resource replicas over WireGuard.
+
+Runners fail on timeouts, missing markers, guest failures and kernel
+warnings/oops/panics. Pair guests are stopped after verification; graceful
+teardown is covered separately. See docu/modern-kernel.rst for dated results
+and limits. Existing compiler warnings, sustained-load testing, KASAN/KCSAN
+runtime coverage and signature-enforced loading remain release checks.

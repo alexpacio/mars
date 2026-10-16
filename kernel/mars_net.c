@@ -37,6 +37,13 @@
 #include <linux/module.h>
 #include <linux/string.h>
 #include <linux/moduleparam.h>
+#include <linux/inet.h>
+#include <linux/netdevice.h>
+#include <linux/rtnetlink.h>
+#include <net/rtnetlink.h>
+#include <net/ipv6.h>
+#include <net/route.h>
+#include <net/addrconf.h>
 
 #include "mars.h"
 #include "mars_net.h"
@@ -55,12 +62,22 @@ module_param_named(mars_port, mars_net_default_port, int, 0);
 __u32 enabled_net_compressions = 0;
 __u32 used_net_compression = 0;
 
-/* TODO: allow binding to specific source addresses instead of catch-all.
- * TODO: make all the socket options configurable.
- * TODO: implement signal handling.
- * TODO: add authentication.
- * TODO: add compression / encryption.
+/* Network authentication and encryption are delegated to WireGuard.  A
+ * listener on a public interface is never enabled implicitly.  Parameters
+ * are immutable after load so established sockets cannot change policy.
  */
+char *mars_listen_addr = "127.0.0.1";
+static char *mars_source_addr;
+static char *mars_interface;
+static bool mars_allow_insecure;
+module_param(mars_listen_addr, charp, 0400);
+module_param(mars_source_addr, charp, 0400);
+module_param(mars_interface, charp, 0400);
+module_param(mars_allow_insecure, bool, 0400);
+MODULE_PARM_DESC(mars_listen_addr, "Listener IP literal (default 127.0.0.1; IPv6 supported)");
+MODULE_PARM_DESC(mars_source_addr, "Optional outgoing source IP literal");
+MODULE_PARM_DESC(mars_interface, "WireGuard interface for authenticated cluster traffic");
+MODULE_PARM_DESC(mars_allow_insecure, "Explicitly permit unauthenticated trusted-network traffic (unsafe)");
 
 struct mars_tcp_params mars_tcp_params[MARS_TRAFFIC_MAX] = {
 	[MARS_TRAFFIC_META] = {
@@ -114,85 +131,134 @@ void __setsockopt(struct socket *sock, int level, int optname, char *optval, int
 
 int mars_create_sockaddr(struct sockaddr_storage *addr, const char *spec)
 {
-	struct sockaddr_in *sockaddr = (void*)addr;
-	char *new_spec = brick_strdup(spec);
-	int port_nr = mars_net_default_port + MARS_TRAFFIC_META;
-	int i;
-	int max_retry = 3;
-	int status;
+	struct sockaddr_in *v4 = (void *)addr;
+	struct sockaddr_in6 *v6 = (void *)addr;
+	char *host, *port, *end, *translated;
+	const char *parsed;
+	int port_nr = mars_net_default_port;
+	int attempts = 3;
+	int status = -EINVAL;
 
-	/* Parse any :port_nr part */
-	for (i = 0; new_spec[i]; i++) {
-		if (new_spec[i] != ':')
-			continue;
-		new_spec[i++] = '\0';
-		sscanf(new_spec + i, "%d", &port_nr);
-		if (port_nr < mars_net_default_port)
-			port_nr = mars_net_default_port;
-		if (port_nr >= mars_net_default_port + MARS_TRAFFIC_MAX)
-			port_nr = mars_net_default_port + MARS_TRAFFIC_MAX - 1;
-		break;
-	}
-
-	/* fail silently, this can happen with "(none)" */
-	if (*new_spec == '(') {
-		status = -EINVAL;
-		goto done;
-	}
-
-	memset(addr, 0, sizeof(*addr));
-	sockaddr->sin_family = AF_INET;
-	sockaddr->sin_port = htons(port_nr);
-
- retry:
-	/*
-	 * TODO: add IPV6 syntax and many more features :)
-	 */
-	if (!*new_spec) {
-		MARS_DBG("Empty IP => 0.0.0.0\n");
-		status = 0;
-	} else if (*new_spec == '[') {
-		MARS_ERR("IPv6 is NYI\n");
-		status = -ENOPKG;
-		goto done;
-	} else if (*new_spec >= '0' && *new_spec <= '9' ) {
-		unsigned char u0 = 0, u1 = 0, u2 = 0, u3 = 0;
-
-		status = sscanf(new_spec,
-				"%hhu.%hhu.%hhu.%hhu",
-				&u0, &u1, &u2, &u3);
-		if (status != 4) {
-			MARS_ERR("invalid sockaddr IP syntax '%s', status = %d\n",
-				 new_spec, status);
-			status = -EINVAL;
+	if (!spec || strlen(spec) >= 256)
+		return -EINVAL;
+	host = brick_strdup(spec);
+	if (!host)
+		return -ENOMEM;
+retry:
+	port = NULL;
+	if (host[0] == '[') {
+		end = strchr(host, ']');
+		if (!end || end == host + 1 || (end[1] && end[1] != ':'))
 			goto done;
+		if (end[1])
+			port = end + 2;
+		*end = '\0';
+		memmove(host, host + 1, strlen(host));
+	} else {
+		end = strchr(host, ':');
+		if (end && !strchr(end + 1, ':')) {
+			*end = '\0';
+			port = end + 1;
 		}
-		MARS_DBG("decoded IP = %u.%u.%u.%u\n", u0, u1, u2, u3);
-		sockaddr->sin_addr.s_addr = (__be32)u0 | (__be32)u1 << 8 | (__be32)u2 << 16 | (__be32)u3 << 24;
+	}
+	if (port && (kstrtoint(port, 10, &port_nr) ||
+		     port_nr < 1 || port_nr > 65535))
+		goto done;
+	memset(addr, 0, sizeof(*addr));
+	if (!*host || (in4_pton(host, -1, (u8 *)&v4->sin_addr, -1, &parsed) && !*parsed)) {
+		v4->sin_family = AF_INET;
+		v4->sin_port = htons(port_nr);
 		status = 0;
-	} else if (mars_translate_hostname) {
-		char *trans_spec = mars_translate_hostname(new_spec);
-
-		if (trans_spec &&
-		    strcmp(trans_spec, new_spec) &&
-		    max_retry-- > 0) {
-			brick_string_free(new_spec);
-			new_spec = trans_spec;
+	} else if (in6_pton(host, -1, (u8 *)&v6->sin6_addr, -1, &parsed) && !*parsed) {
+		v6->sin6_family = AF_INET6;
+		v6->sin6_port = htons(port_nr);
+		status = 0;
+	} else if (mars_translate_hostname && attempts-- > 0 && host[0] != '(') {
+		translated = mars_translate_hostname(host);
+		if (translated && strcmp(translated, host)) {
+			brick_string_free(host);
+			host = translated;
 			goto retry;
 		}
-		brick_string_free(trans_spec);
-		MARS_ERR("unknown address '%s'\n", new_spec);
-		status = -EDESTADDRREQ;
-	  } else {
-		MARS_ERR("cannot translate '%s'\n", new_spec);
+		brick_string_free(translated);
 		status = -EDESTADDRREQ;
 	}
-
- done:
-	brick_string_free(new_spec);
+done:
+	brick_string_free(host);
 	return status;
 }
 EXPORT_SYMBOL_GPL(mars_create_sockaddr);
+
+static int mars_addr_len(const struct sockaddr_storage *addr)
+{
+	return addr->ss_family == AF_INET6 ? sizeof(struct sockaddr_in6) :
+		sizeof(struct sockaddr_in);
+}
+
+bool mars_net_enabled(void)
+{
+	return (mars_interface && *mars_interface) || mars_allow_insecure;
+}
+
+/* Bind before connect/listen: inbound and outbound packets must use the
+ * authenticated interface.  Checking its link kind prevents accidentally
+ * treating an ordinary Ethernet interface as an authentication boundary.
+ */
+static int mars_secure_socket(struct socket *sock)
+{
+	struct net_device *dev;
+	bool wireguard = false;
+	int status;
+
+	if (mars_interface && *mars_interface) {
+		if (strlen(mars_interface) >= IFNAMSIZ)
+			return -EINVAL;
+		rtnl_lock();
+		dev = __dev_get_by_name(&init_net, mars_interface);
+		if (dev && dev->rtnl_link_ops)
+			wireguard = !strcmp(dev->rtnl_link_ops->kind, "wireguard");
+		rtnl_unlock();
+		if (!wireguard)
+			return -EACCES;
+#ifdef MARS_MODERN_KERNEL
+		status = do_sock_setsockopt(sock, false, SOL_SOCKET, SO_BINDTODEVICE,
+			KERNEL_SOCKPTR(mars_interface), strlen(mars_interface) + 1);
+#else
+		status = kernel_setsockopt(sock, SOL_SOCKET, SO_BINDTODEVICE,
+			mars_interface, strlen(mars_interface) + 1);
+#endif
+		return status;
+	}
+	if (mars_allow_insecure) {
+		pr_warn_once("MARS: unauthenticated network access explicitly enabled; use WireGuard in production\n");
+		return 0;
+	}
+	MARS_ERR("remote traffic requires mars_interface=<WireGuard interface>\n");
+	return -EACCES;
+}
+
+/* Linux may deliver locally generated traffic to a device-bound listener
+ * via a local route.  Such traffic has never passed WireGuard authentication.
+ * Reject local source addresses as well as binding to the tunnel interface.
+ */
+static bool mars_peer_admitted(struct socket *sock)
+{
+	struct sockaddr_storage peer = {};
+
+	if (!mars_interface || !*mars_interface)
+		return mars_allow_insecure;
+	if (kernel_getpeername(sock, (struct sockaddr *)&peer) < 0)
+		return false;
+	if (peer.ss_family == AF_INET)
+		return inet_addr_type(&init_net,
+			((struct sockaddr_in *)&peer)->sin_addr.s_addr) != RTN_LOCAL;
+#if IS_ENABLED(CONFIG_IPV6)
+	if (peer.ss_family == AF_INET6)
+		return !ipv6_chk_addr(&init_net,
+			&((struct sockaddr_in6 *)&peer)->sin6_addr, NULL, 0);
+#endif
+	return false;
+}
 
 static int current_debug_nr = 0; // no locking, just for debugging
 
@@ -215,7 +281,8 @@ void _set_socketopts(struct socket *sock, struct mars_tcp_params *params, bool i
 	 */
 	if (is_server) {
 		/* extra options for server sockets */
-		_setsockopt(sock, SOL_SOCKET, IP_FREEBIND, x_true);
+		if (sock->sk->sk_family == AF_INET)
+			_setsockopt(sock, SOL_IP, IP_FREEBIND, x_true);
 	}
 	lock_sock(sock->sk);
 	sock->sk->sk_rcvtimeo = sock->sk->sk_sndtimeo = params->tcp_timeout * HZ;
@@ -226,7 +293,8 @@ void _set_socketopts(struct socket *sock, struct mars_tcp_params *params, bool i
 	_setsockopt(sock, SOL_SOCKET, SO_SNDBUFFORCE, params->tcp_window_size);
 	_setsockopt(sock, SOL_SOCKET, SO_RCVBUFFORCE, params->tcp_window_size);
 #ifdef CONFIG_MARS_IPv4_TOS
-	_setsockopt(sock, SOL_IP, IP_TOS, params->ip_tos);
+	if (sock->sk->sk_family == AF_INET)
+		_setsockopt(sock, SOL_IP, IP_TOS, params->ip_tos);
 #endif
 	_setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, params->tcp_nodelay);
 	_setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE, x_true);
@@ -265,9 +333,9 @@ int mars_create_socket(struct mars_socket *msock,
 	atomic_set(&msock->s_count, 1);
 
 #ifdef __HAS_STRUCT_NET
-	status = sock_create_kern(&init_net, AF_INET, SOCK_STREAM, IPPROTO_TCP, &msock->s_socket);
+	status = sock_create_kern(&init_net, sockaddr->sa_family, SOCK_STREAM, IPPROTO_TCP, &msock->s_socket);
 #else
-	status = sock_create_kern(AF_INET, SOCK_STREAM, IPPROTO_TCP, &msock->s_socket);
+	status = sock_create_kern(sockaddr->sa_family, SOCK_STREAM, IPPROTO_TCP, &msock->s_socket);
 #endif
 	if (unlikely(status < 0 || !msock->s_socket)) {
 		msock->s_socket = NULL;
@@ -280,11 +348,35 @@ int mars_create_socket(struct mars_socket *msock,
 	msock->s_alive = true;
 	msock->s_connected = false;
 
+	status = mars_secure_socket(sock);
+	if (status < 0)
+		goto done;
 	_set_socketopts(sock, params, is_server);
+	if (addr->ss_family == AF_INET6) {
+		int one = 1;
+
+		_setsockopt(sock, IPPROTO_IPV6, IPV6_V6ONLY, one);
+	}
+	if (!is_server && mars_source_addr && *mars_source_addr) {
+		struct sockaddr_storage source;
+
+		status = mars_create_sockaddr(&source, mars_source_addr);
+		if (status < 0 || source.ss_family != addr->ss_family) {
+			status = -EINVAL;
+			goto done;
+		}
+		if (source.ss_family == AF_INET6)
+			((struct sockaddr_in6 *)&source)->sin6_port = 0;
+		else
+			((struct sockaddr_in *)&source)->sin_port = 0;
+		status = kernel_bind(sock, (void *)&source, mars_addr_len(&source));
+		if (status < 0)
+			goto done;
+	}
 
 	mb();
 	if (is_server) {
-		status = kernel_bind(sock, (void *)sockaddr, sizeof(*sockaddr));
+		status = kernel_bind(sock, (void *)sockaddr, mars_addr_len(addr));
 		if (unlikely(status < 0)) {
 			MARS_WRN("#%d bind failed, status = %d\n", msock->s_debug_nr, status);
 			goto done;
@@ -295,7 +387,7 @@ int mars_create_socket(struct mars_socket *msock,
 		}
 	} else {
 		/* according to net/socket.c the correct spelling is O_NONBLOCK */
-		status = kernel_connect(sock, (void *)sockaddr, sizeof(*sockaddr), O_NONBLOCK);
+		status = kernel_connect(sock, (void *)sockaddr, mars_addr_len(addr), O_NONBLOCK);
 		/* Treat non-blocking connects as successful.
 		 * Any potential errors will show up later during traffic.
 		 */
@@ -348,6 +440,12 @@ int mars_accept_socket(struct mars_socket *new_msock,
 
 		MARS_IO("old#%d status = %d file = %px flags = 0x%x\n", old_msock->s_debug_nr, status, new_socket->file, new_socket->file ? new_socket->file->f_flags : 0);
 
+		if (!mars_peer_admitted(new_socket)) {
+			sock_release(new_socket);
+			new_socket = NULL;
+			status = -EACCES;
+			goto err;
+		}
 		_set_socketopts(new_socket, params, false);
 
 		memset(new_msock, 0, sizeof(struct mars_socket));
@@ -369,12 +467,11 @@ EXPORT_SYMBOL_GPL(mars_accept_socket);
 bool mars_get_socket(struct mars_socket *msock)
 {
 	MARS_LOW("#%d get socket %px s_count=%d\n", msock->s_debug_nr, msock->s_socket, atomic_read(&msock->s_count));
-	if (unlikely(atomic_read(&msock->s_count) <= 0)) {
+	if (unlikely(!atomic_inc_not_zero(&msock->s_count))) {
 		MARS_ERR("#%d bad nesting on msock = %px\n", msock->s_debug_nr, msock);
 		return false;
 	}
 
-	atomic_inc(&msock->s_count);
 
 	mb();
 	if (unlikely(!msock->s_socket || !msock->s_alive)) {
@@ -711,7 +808,12 @@ int mars_recv_raw(struct mars_socket *msock, void *buf, int minlen, int maxlen)
 	int may_wait = 0;
 	int status = -EIDRM;
 	int done = 0;
+	unsigned long deadline;
 
+	if (minlen < 0 || maxlen < minlen)
+		return -EINVAL;
+	if (!maxlen)
+		return 0;
 	if (!buf) {
 		buf = dummy = brick_block_alloc(0, maxlen);
 	}
@@ -722,11 +824,16 @@ int mars_recv_raw(struct mars_socket *msock, void *buf, int minlen, int maxlen)
 
 	if (!mars_get_socket(msock))
 		goto final;
+	deadline = jiffies + max_t(long, HZ, msock->s_socket->sk->sk_rcvtimeo);
 
 	/* wait until there is enough data for receiving */
 	for (;;) {
 		struct socket *sock;
 
+		if (time_after_eq(jiffies, deadline) || brick_thread_should_stop()) {
+			status = -ETIMEDOUT;
+			goto err;
+		}
 		space = mars_socket_read_available(msock);
 		if (space > 0 && space >= minlen) {
 			break;
@@ -771,7 +878,7 @@ int mars_recv_raw(struct mars_socket *msock, void *buf, int minlen, int maxlen)
 			status = -EIDRM;
 			goto err;
 		}
-		if (!mars_net_is_alive ||
+		if (!mars_net_is_alive || time_after_eq(jiffies, deadline) ||
 		    brick_thread_should_stop()) {
 			MARS_WRN("#%d interrupting, done = %d\n",
 				 msock->s_debug_nr, done);
@@ -903,7 +1010,7 @@ void dump_meta(const struct meta *meta)
 }
 
 static
-int _add_fields(struct mars_desc_item *mi, const struct meta *meta, int offset, const char *prefix, int maxlen)
+int _add_fields(struct mars_desc_item *mi, const struct meta *meta, int offset, const char *prefix, int maxlen, bool filter_x)
 {
 	int count = 0;
 	for (; meta->field_name != NULL; meta++) {
@@ -911,6 +1018,9 @@ int _add_fields(struct mars_desc_item *mi, const struct meta *meta, int offset, 
 		int new_offset;
 		int len;
 
+		/* Upstream protocol 3: old receivers cannot skip extension fields. */
+		if (filter_x && meta->field_name[0] == 'x')
+			continue;
 		new_prefix = mi->field_name;
 		new_offset = offset + meta->field_offset;
 
@@ -922,7 +1032,7 @@ int _add_fields(struct mars_desc_item *mi, const struct meta *meta, int offset, 
 			goto done;
 		}
 		
-		len = scnprintf(mi->field_name, MAX_FIELD_LEN, "%s.%s", prefix, meta->field_name);
+		len = snprintf(mi->field_name, MAX_FIELD_LEN, "%s.%s", prefix, meta->field_name);
 		if (unlikely(len >= MAX_FIELD_LEN)) {
 			MARS_ERR("field len overflow on '%s.%s'\n", prefix, meta->field_name);
 			count = -1;
@@ -941,7 +1051,7 @@ int _add_fields(struct mars_desc_item *mi, const struct meta *meta, int offset, 
 
 		if (meta->field_type == FIELD_SUB) {
 			int sub_count;
-			sub_count = _add_fields(mi, meta->field_ref, new_offset, new_prefix, maxlen);
+			sub_count = _add_fields(mi, meta->field_ref, new_offset, new_prefix, maxlen, filter_x);
 			if (sub_count < 0)
 				return sub_count;
 
@@ -992,7 +1102,7 @@ struct mars_desc_cache *make_sender_cache(struct mars_socket *msock, const struc
 	maxlen -= sizeof(struct mars_desc_cache);
 	mi = (void*)(mc + 1);
 
-	status = _add_fields(mi, meta, 0, "", maxlen);
+	status = _add_fields(mi, meta, 0, "", maxlen, msock->s_remote_proto_level < 3);
 
 	if (likely(status > 0)) {
 		mc->cache_items = status;
@@ -1007,58 +1117,70 @@ done:
 	return mc;
 }
 
-static
-int _make_recver_cache(struct mars_desc_cache *mc, const struct meta *meta, int offset, const char *prefix)
+/* Map names to LOCAL offsets and sizes.  Never trust received offsets,
+ * including offsets on fields that this version does not recognize.
+ */
+static int _make_recver_cache(struct mars_desc_cache *mc, const struct meta *meta,
+			      int offset, const char *prefix)
 {
-	char *tmp = brick_string_alloc(MAX_FIELD_LEN);
+	char name[MAX_FIELD_LEN];
 	int count = 0;
 	int i;
 
-	for (; meta->field_name != NULL; meta++, count++) {
-		snprintf(tmp, MAX_FIELD_LEN, "%s.%s", prefix, meta->field_name);
+	for (; meta->field_name; meta++) {
+		if (snprintf(name, sizeof(name), "%s.%s", prefix, meta->field_name) >= sizeof(name))
+			return -EOVERFLOW;
 		for (i = 0; i < mc->cache_items; i++) {
-			struct mars_desc_item *mi = ((struct mars_desc_item*)(mc + 1)) + i;
-			if (meta->field_type == mi->field_type &&
-			    !strcmp(tmp, mi->field_name)) {
-				mi->field_recver_offset = offset + meta->field_offset;
-				if (meta->field_type == FIELD_SUB) {
-					int sub_count = _make_recver_cache(mc, meta->field_ref, mi->field_recver_offset, tmp);
-					if (unlikely(sub_count <= 0)) {
-						count = 0;
-						goto done;
-					}
-				}
-				goto found;
-			}
-		}
-		MARS_WRN("field %2d '%s' is missing\n", count, meta->field_name);
-	found:;
-	}
+			struct mars_desc_item *mi = ((struct mars_desc_item *)(mc + 1)) + i;
+			int status;
 
- done:
-	if (unlikely(!count)) {
-		MARS_ERR("bad protocol: ALL fields are missing\n");
+			if (strcmp(name, mi->field_name))
+				continue;
+			if (meta->field_type != mi->field_type ||
+			    (mi->field_type != FIELD_SUB && mi->field_type != FIELD_STRING &&
+			     meta->field_size != mi->field_size))
+				return -EPROTO;
+			mi->field_recver_offset = offset + meta->field_offset;
+			count++;
+			if (meta->field_type == FIELD_SUB) {
+				status = _make_recver_cache(mc, meta->field_ref,
+					mi->field_recver_offset, name);
+				if (status < 0)
+					return status;
+				count += status;
+			}
+			break;
+		}
 	}
-	brick_string_free(tmp);
 	return count;
 }
 
-static
-int make_recver_cache(struct mars_desc_cache *mc, const struct meta *meta)
+static int make_recver_cache(struct mars_desc_cache *mc, const struct meta *meta, int bytes)
 {
-	int count;
-	int i;
+	int i, j, count;
 
+	if (bytes < sizeof(*mc) || bytes > PAGE_SIZE || mc->cache_items <= 0 ||
+	    mc->cache_items > (bytes - sizeof(*mc)) / sizeof(struct mars_desc_item) ||
+	    bytes != sizeof(*mc) + mc->cache_items * sizeof(struct mars_desc_item))
+		return -EPROTO;
+	for (i = 0; i < mc->cache_items; i++) {
+		struct mars_desc_item *mi = ((struct mars_desc_item *)(mc + 1)) + i;
+
+		if (!memchr(mi->field_name, 0, MAX_FIELD_LEN) || !mi->field_name[0] ||
+		    mi->field_type < FIELD_SUB || mi->field_type > FIELD_UINT ||
+		    mi->field_size < 0 || mi->field_size > PAGE_SIZE)
+			return -EPROTO;
+		for (j = 0; j < i; j++) {
+			struct mars_desc_item *other = ((struct mars_desc_item *)(mc + 1)) + j;
+
+			if (!strcmp(mi->field_name, other->field_name))
+				return -EPROTO;
+		}
+		mi->field_recver_offset = -1;
+	}
 	mc->cache_recver_cookie = (u64)meta;
 	count = _make_recver_cache(mc, meta, 0, "");
-
-	for (i = 0; i < mc->cache_items; i++) {
-		struct mars_desc_item *mi = ((struct mars_desc_item*)(mc + 1)) + i;
-		if (unlikely(mi->field_recver_offset < 0)) {
-			MARS_WRN("field '%s' is not transferred\n", mi->field_name);
-		}
-	}
-	return count;
+	return count ? count : -EPROTO;
 }
 
 static
@@ -1089,7 +1211,7 @@ int _desc_send_item(struct mars_socket *msock, const void *data, const struct ma
 		status = mars_send_raw(msock, &len, sizeof(len), cork || len > 0);
 		if (unlikely(status < 0))
 			return status;
-		/* fallthrough */
+		fallthrough;
 	default:
 		if (likely(len > 0)) {
 			status = mars_send_raw(msock, item, len, cork);
@@ -1102,136 +1224,65 @@ done:
 	return res;
 }
 
-static
-int _desc_recv_item(struct mars_socket *msock, void *data, const struct mars_desc_cache *mc, int index, int line)
+/* Consume unknown fields to preserve framing during rolling upgrades. */
+static int mars_skip_bytes(struct mars_socket *msock, int len)
 {
-	struct mars_desc_item *mi = ((struct mars_desc_item*)(mc + 1)) + index;
-	void *item;
-	void *orig_item;
-	int field_recver_offset = mi->field_recver_offset;
-	int field_type;
+	char scratch[128];
+	int status;
+
+	while (len > 0) {
+		int chunk = min_t(int, len, sizeof(scratch));
+
+		status = mars_recv_raw(msock, scratch, chunk, chunk);
+		if (status != chunk)
+			return status < 0 ? status : -ENODATA;
+		len -= chunk;
+	}
+	return 0;
+}
+
+static int _desc_recv_item(struct mars_socket *msock, void *data,
+			   const struct mars_desc_cache *mc, int index, int line)
+{
+	struct mars_desc_item *mi = ((struct mars_desc_item *)(mc + 1)) + index;
+	void *item = data && mi->field_recver_offset >= 0 ?
+		(char *)data + mi->field_recver_offset : NULL;
+	char *str;
 	int len = mi->field_size;
 	int status;
-	int res = -1;
 
-	if (likely(data && field_recver_offset >= 0)) {
-		item = data + field_recver_offset;
-	} else {
-		MARS_ERR("#%d data=%px mc=%px item=%d offset=%d len=%d line=%d\n",
-			 msock->s_debug_nr,
-			 data, mc, index, field_recver_offset, len, line);
-		/* just skip a non-existing field */
-		res = 0;
-		goto done;
+	if (mi->field_type == FIELD_SUB)
+		return 0;
+	if (mi->field_type != FIELD_STRING) {
+		if (!item)
+			return mars_skip_bytes(msock, len);
+		status = mars_recv_raw(msock, item, len, len);
+		return status == len ? len : status < 0 ? status : -ENODATA;
 	}
-	field_type = mi->field_type;
-	if (unlikely(field_type < 0)) {
-		MARS_ERR("#%d field_type=%d item=%d offset=%d len=%d line=%d\n",
-			 msock->s_debug_nr,
-			 field_type, index, field_recver_offset, len, line);
-		goto done;
-	}
-	orig_item = item;
-
-	switch (field_type) {
-	case FIELD_REF:
-		MARS_ERR("NYI\n");
-		goto done;
-	case FIELD_SUB:
-		/* skip this */
-		res = 0;
-		break;
-	case FIELD_STRING:
-		len = 0;
-		status = mars_recv_raw(msock, &len, sizeof(len), sizeof(len));
-		if (unlikely(status < 0))
-			goto done;
-		if (unlikely(len < 0 || len > KMALLOC_MAX_SIZE)) {
-			MARS_ERR("#%d bad string alloc size %d\n",
-				 msock->s_debug_nr, len);
-			status = -EOVERFLOW;
-			goto done;
-		}
-
-		if (len > 0 && item) {
-			char *str = *(void **)item;
-
-			if (unlikely(str)) {
-				MARS_ERR("#%d string already allocated %px at address %px\n",
-					 msock->s_debug_nr,
-					 str, item);
-				if (*str) {
-					MARS_DBG("#%d old string='%s'\n",
-						 msock->s_debug_nr, str);
-				}
-				status = -EINVAL;
-				goto done;
-			}
-			str = _brick_string_alloc(len, line);
-			if (unlikely(!str)) {
-				MARS_ERR("#%d string alloc error\n",
-					 msock->s_debug_nr);
-				status = -ENOMEM;
-				goto done;
-			}
-			/* safeguard against any suspected  problems */
-			*str = '\0';
-			item = str;
-		}
-
-		/* fallthrough */
-	default:
-		if (likely(len > 0)) {
-			status = mars_recv_raw(msock, item, len, len);
-			if (unlikely(status < 0))
-				goto failed_recv_item;
-
-			/* Protect string transfers against mischief */
-			if (field_type == FIELD_STRING) {
-				char *str = item;
-
-				/* Prevent kernel memory corruption
-				 * by short or long read, e.g. protocol
-				 * errors etc.
-				 */
-				if (unlikely(status < len)) {
-					MARS_ERR("#%d string short read %d < %d\n",
-						 msock->s_debug_nr,
-						 status, len);
-					status = -ENODATA;
-					goto failed_recv_item;
-				}
-				if (unlikely(status > len)) {
-					MARS_DBG("#%d string oversized read %d > %d\n",
-						 msock->s_debug_nr,
-						 status, len);
-				}
-				/* Protect against damaged network packets */
-				if (unlikely(str[len-1])) {
-					str[len-1] = '\0';
-					MARS_WRN("#%d string '%s' not terminated by NUL\n",
-						 msock->s_debug_nr, str);
-				}
-			}
-			/* generic pointer swizzling, only after successful transport */
-			if (item != orig_item) {
-				*(void **)orig_item = item;
-			}
-		}
-		res = len;
-	}
-done:
-	return res;
-
- failed_recv_item:
-	/* Safeguard against dangling strings.
+	status = mars_recv_raw(msock, &len, sizeof(len), sizeof(len));
+	if (status != sizeof(len))
+		return status < 0 ? status : -ENODATA;
+	/* Paths, path lists and link values are bounded independently of the
+	 * host allocator's maximum allocation size (which may be gigabytes).
 	 */
-	if (item && item != orig_item) {
-		char *str = item;
-
+	if (len < 0 || len > MARS_NET_STRING_MAX)
+		return -EMSGSIZE;
+	if (!item)
+		return mars_skip_bytes(msock, len);
+	if (*(char **)item)
+		return -EPROTO;
+	if (!len)
+		return 0;
+	str = _brick_string_alloc(len, line);
+	if (!str)
+		return -ENOMEM;
+	status = mars_recv_raw(msock, str, len, len);
+	if (status != len || str[len - 1] || memchr(str, 0, len - 1)) {
 		brick_string_free(str);
+		return status < 0 ? status : -EPROTO;
 	}
-	goto done;
+	*(char **)item = str;
+	return len;
 }
 
 #define MARS_DESC_MAGIC 0x73f0A2ec6148f48dll
@@ -1249,7 +1300,7 @@ int _desc_send_struct(struct mars_socket *msock, int cache_index, const void *da
 	const struct mars_desc_cache *mc = msock->s_desc_send[cache_index];
 	struct mars_desc_header header = {
 		.h_magic = MARS_DESC_MAGIC,
-		.h_cookie = mc->cache_sender_cookie,
+		.h_cookie = cache_index + 1,
 		.h_meta_len = h_meta_len,
 		.h_index = data ? cache_index : -1,
 	};
@@ -1264,8 +1315,17 @@ int _desc_send_struct(struct mars_socket *msock, int cache_index, const void *da
 		goto err;
 
 	if (unlikely(h_meta_len > 0)) {
-		status = mars_send_raw(msock, mc, h_meta_len, true);
-		MARS_IO("#%d sent mc=%px h_meta_len=%d status=%d\n", msock->s_debug_nr, mc, h_meta_len, status);
+		struct mars_desc_cache wire_cache = *mc;
+
+		/* The local cache key is a kernel pointer.  It is never needed by
+		 * the peer, including legacy peers; send an opaque index instead.
+		 */
+		wire_cache.cache_sender_cookie = cache_index + 1;
+		wire_cache.cache_recver_cookie = 0;
+		status = mars_send_raw(msock, &wire_cache, sizeof(wire_cache), true);
+		if (unlikely(status < 0))
+			goto err;
+		status = mars_send_raw(msock, mc + 1, h_meta_len - sizeof(*mc), true);
 		if (unlikely(status < 0))
 			goto err;
 	}
@@ -1293,6 +1353,11 @@ int desc_send_struct(struct mars_socket *msock, const void *data, const struct m
 	int h_meta_len = 0;
 	int status = -EINVAL;
 
+	if (!data) {
+		struct mars_desc_header end = { .h_magic = MARS_DESC_MAGIC, .h_index = -1 };
+
+		return mars_send_raw(msock, &end, sizeof(end), cork);
+	}
 	for (i = 0; i < MAX_DESC_CACHE; i++) {
 		mc = msock->s_desc_send[i];
 		if (!mc)
@@ -1328,6 +1393,11 @@ int desc_recv_struct(struct mars_socket *msock, void *data, const struct meta *m
 	if (unlikely(status < 0))
 		goto err;
 
+	if (status != sizeof(header) || header.h_meta_len < 0 ||
+	    header.h_meta_len > PAGE_SIZE) {
+		status = -EPROTO;
+		goto err;
+	}
 	if (unlikely(header.h_magic != MARS_DESC_MAGIC)) {
 		MARS_WRN("#%d called from line %d bad packet header magic = %llx\n", msock->s_debug_nr, line, header.h_magic);
 		status = -ENOMSG;
@@ -1335,8 +1405,13 @@ int desc_recv_struct(struct mars_socket *msock, void *data, const struct meta *m
 	}
 
 	cache_index = header.h_index;
-	if (cache_index < 0) { // EOR
+	if (cache_index == -1) { /* EOR; tolerate a bounded legacy description. */
+		status = mars_skip_bytes(msock, header.h_meta_len);
 		goto done;
+	}
+	if (cache_index < -1) {
+		status = -EPROTO;
+		goto err;
 	}
 	if (unlikely(cache_index >= MAX_DESC_CACHE - 1)) {
 		MARS_WRN("#%d called from line %d bad cache index %d\n", msock->s_debug_nr, line, cache_index);
@@ -1346,7 +1421,7 @@ int desc_recv_struct(struct mars_socket *msock, void *data, const struct meta *m
 
 	mc = msock->s_desc_recv[cache_index];
 	if (unlikely(!mc)) {
-		if (unlikely(header.h_meta_len <= 0)) {
+		if (unlikely(header.h_meta_len < sizeof(struct mars_desc_cache))) {
 			MARS_WRN("#%d called from line %d missing meta information\n", msock->s_debug_nr, line);
 			status = -ENOMSG;
 			goto err;
@@ -1361,12 +1436,13 @@ int desc_recv_struct(struct mars_socket *msock, void *data, const struct meta *m
 
 		status = mars_recv_raw(msock, mc, header.h_meta_len, header.h_meta_len);
 		MARS_IO("#%d got mc=%px h_meta_len=%d status=%d\n", msock->s_debug_nr, mc, header.h_meta_len, status);
-		if (unlikely(status < 0)) {
+		if (unlikely(status != header.h_meta_len)) {
 			brick_block_free(mc, PAGE_SIZE);
+			status = status < 0 ? status : -ENODATA;
 			goto err;
 		}
 
-		status = make_recver_cache(mc, meta);
+		status = make_recver_cache(mc, meta, header.h_meta_len);
 		if (unlikely(status < 0)) {
 			brick_block_free(mc, PAGE_SIZE);
 			goto err;
@@ -1446,7 +1522,24 @@ int _mars_recv_cmd(struct mars_socket *msock, struct mars_cmd *cmd, int line)
 	int status;
 
 	status = desc_recv_struct(msock, cmd, mars_cmd_meta, line);
-	if (status >= 0) {
+	if (!status)
+		return -EPROTO; /* End markers are only valid in structure lists. */
+	if (status > 0) {
+		int op = cmd->cmd_code & CMD_FLAG_MASK;
+		__u32 compression = cmd->cmd_compr_flags;
+
+		if (cmd->cmd_proto < 0 || cmd->cmd_proto > 255 ||
+		    cmd->cmd_code < 0 || op >= CMD_LAST ||
+		    (cmd->cmd_code & ~(CMD_FLAG_MASK | CMD_FLAG_HAS_DATA)) ||
+		    ((cmd->cmd_code & CMD_FLAG_HAS_DATA) && op != CMD_MREF && op != CMD_CB) ||
+		    cmd->cmd_compr_len < 0 || cmd->cmd_compr_len > MARS_NET_MREF_DATA_MAX ||
+		    !!compression != !!cmd->cmd_compr_len ||
+		    (compression && (!(cmd->cmd_code & CMD_FLAG_HAS_DATA) ||
+			(compression & ~MREF_COMPRESS_ANY) || (compression & (compression - 1)))) ||
+		    cmd->cmd_stamp.tv_sec < 0 || cmd->cmd_stamp.tv_nsec < 0 ||
+		    cmd->cmd_stamp.tv_nsec >= NSEC_PER_SEC)
+			return -EPROTO;
+
 		msock->s_remote_proto_level = cmd->cmd_proto;
 		msock->s_common_proto_level = min(cmd->cmd_proto, MARS_PROTO_LEVEL);
 		if (cmd->cmd_stamp.tv_sec)
@@ -1614,18 +1707,59 @@ int mars_recv_mref(struct mars_socket *msock, struct mref_object *mref, struct m
 	void *tmp_buf = NULL;
 	void *ref_data;
 	int ref_len;
+	int original_len = mref->ref_len;
+	loff_t original_pos = mref->ref_pos;
+	int original_id = mref->ref_id;
+	__u32 original_flags = mref->ref_flags;
 	int status;
 
 	status = desc_recv_struct(msock, mref, mars_mref_meta, __LINE__);
-	if (status < 0)
+	if (status <= 0) {
+		if ((cmd->cmd_code & CMD_FLAG_MASK) == CMD_CB && original_len > 0) {
+			mref->ref_len = original_len;
+			mref->ref_pos = original_pos;
+			mref->ref_id = original_id;
+			mref->ref_flags = original_flags;
+		}
+		status = status < 0 ? status : -EPROTO;
 		goto done;
+	}
 
 	/* compatibility to old protocol */
 	_recv_deprecated(mref);
 
+	/* A callback must stay inside the original request's buffer and
+	 * range.  Validate before receiving or decompressing its data.
+	 */
+	if ((cmd->cmd_code & CMD_FLAG_MASK) == CMD_CB && original_len > 0 &&
+	    (mref->ref_len < 0 || mref->ref_len > original_len ||
+	     mref->ref_pos != original_pos || mref->ref_id != original_id ||
+	     ((mref->ref_flags ^ original_flags) & MREF_WRITE))) {
+		mref->ref_len = original_len;
+		mref->ref_pos = original_pos;
+		mref->ref_id = original_id;
+		mref->ref_flags = original_flags;
+		status = -EPROTO;
+		goto done;
+	}
 	ref_data = mref->ref_data;
 	ref_len = mref->ref_len;
-	if (unlikely(ref_len < 0 || ref_len > MARS_NET_MREF_DATA_MAX)) {
+	/* NODATA requests are checksum-only reads. A write without a payload
+	 * would otherwise send an uninitialized backend allocation to storage.
+	 */
+	if ((cmd->cmd_code & CMD_FLAG_MASK) == CMD_MREF &&
+	    ((mref->ref_flags & ~MREF_ALL_FLAGS) ||
+	     ((mref->ref_flags & MREF_WRITE) &&
+	      ((mref->ref_flags & MREF_NODATA) || !(cmd->cmd_code & CMD_FLAG_HAS_DATA))) ||
+	     ((mref->ref_flags & MREF_DISCARD) && !(mref->ref_flags & MREF_WRITE)))) {
+		status = -EPROTO;
+		goto done;
+	}
+	if (unlikely(ref_len < 0 || ref_len > MARS_NET_MREF_DATA_MAX ||
+		     mref->ref_pos < 0 || mref->ref_pos > S64_MAX - ref_len ||
+		     ((cmd->cmd_code & CMD_FLAG_MASK) == CMD_MREF &&
+		      (!ref_len || ((mref->ref_flags & MREF_WRITE) &&
+			!(mref->ref_flags & MREF_NODATA) && !(cmd->cmd_code & CMD_FLAG_HAS_DATA)))))) {
 		MARS_ERR("invalid len=%d\n", ref_len);
 		status = -EINVAL;
 		goto done;
@@ -1636,7 +1770,15 @@ int mars_recv_mref(struct mars_socket *msock, struct mref_object *mref, struct m
 	if (cmd->cmd_compr_flags && cmd->cmd_compr_len) {
 		void *decompr_buf;
 
+		if (!ref_len || cmd->cmd_compr_len >= ref_len) {
+			status = -EPROTO;
+			goto done;
+		}
 		tmp_buf = brick_mem_alloc(cmd->cmd_compr_len);
+		if (!tmp_buf) {
+			status = -ENOMEM;
+			goto done;
+		}
 
 		status = mars_recv_raw(msock,
 				       tmp_buf,
@@ -1653,6 +1795,10 @@ int mars_recv_mref(struct mars_socket *msock, struct mref_object *mref, struct m
 		/* Ensure that length is block-aligned */
 		if (!ref_data) {
 			ref_data = brick_block_alloc(0, ref_len);
+			if (!ref_data) {
+				status = -ENOMEM;
+				goto done;
+			}
 		}
 
 		status = -EBADMSG;
@@ -1660,8 +1806,11 @@ int mars_recv_mref(struct mars_socket *msock, struct mref_object *mref, struct m
 			mars_decompress(tmp_buf, cmd->cmd_compr_len,
 					ref_data, ref_len,
 					cmd->cmd_compr_flags);
-		if (unlikely(!decompr_buf))
+		if (unlikely(!decompr_buf)) {
+			if (!mref->ref_data)
+				brick_block_free(ref_data, ref_len);
 			goto done;
+		}
 		if (unlikely(decompr_buf != ref_data))
 			brick_block_free(ref_data, ref_len);
 
@@ -1691,8 +1840,8 @@ int mars_recv_mref(struct mars_socket *msock, struct mref_object *mref, struct m
 			MARS_WRN("#%d short read on data=%px len=%d/%d\n",
 				 msock->s_debug_nr,
 				 ref_data, status, ref_len);
-			if (!mref->ref_data)
 			status = -ENODATA;
+			if (!mref->ref_data)
 				brick_block_free(ref_data, ref_len);
 			goto done;
 		}
@@ -1757,6 +1906,8 @@ EXPORT_SYMBOL_GPL(mars_net_is_alive);
 int __init init_mars_net(void)
 {
 	MARS_INF("init_net()\n");
+	if (!mars_net_enabled())
+		pr_info("MARS: networking disabled; configure mars_interface for authenticated transport\n");
 	mars_net_is_alive = true;
 	return 0;
 }

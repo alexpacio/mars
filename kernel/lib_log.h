@@ -59,6 +59,7 @@ struct log_header_v1 {
 	short  l_len;
 	short  l_decompress_len;
 	short  l_code;
+	unsigned int l_flags; /* optional hint in the existing four-byte spare */
 	unsigned int l_seq_nr;
 	__u32  l_crc_old;
 	__u16  l_crc_flags;
@@ -69,6 +70,12 @@ struct log_header_v1 {
 #define CODE_UNKNOWN     0
 #define CODE_WRITE_NEW   1
 #define CODE_WRITE_OLD   2
+
+/* Old readers ignore the spare and replay the zero payload as a normal write.
+ * This is only a deallocation hint: positions, lengths and checksums retain
+ * their existing format. Unknown hint values must never cause deallocation.
+ */
+#define LOG_HINT_DISCARD 0x4d445343U
 
 #define START_MAGIC  0xa8f7e908d9177957ll
 #define END_MAGIC    0x74941fb74ab5726dll
@@ -106,16 +113,19 @@ struct log_header_v1 {
 #define _LOG_PAD_BITS 3
 #define _LOG_PAD (1 << _LOG_PAD_BITS)
 
-// TODO: make this bytesex-aware.
+/* Version 1 retains the historical native-endian layout. Use memcpy because
+ * serialized timestamp and offset fields need not be naturally aligned.
+ */
 #define DATA_PUT(data,offset,val)				\
 	do {							\
-		*((typeof(val)*)((data)+offset)) = val;		\
+		typeof(val) log_value = (val);			\
+		memcpy((data) + (offset), &log_value, sizeof(log_value)); \
 		offset += sizeof(val);				\
 	} while (0)
 
 #define DATA_GET(data,offset,val)				\
 	do {							\
-		val = *((typeof(val)*)((data)+offset));		\
+		memcpy(&(val), (data) + (offset), sizeof(val));	\
 		offset += sizeof(val);				\
 	} while (0)
 

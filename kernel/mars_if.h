@@ -49,6 +49,7 @@ extern struct mars_limiter if_throttle;
 struct bio_wrapper {
 	struct bio *bio;
 	atomic_t bi_comp_cnt;
+	int error;
 	unsigned long start_time;
 };
 

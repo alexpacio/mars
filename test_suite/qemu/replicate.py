@@ -2,6 +2,7 @@
 """Check initial sync and transaction-log replication between two microvms."""
 import argparse
 import json
+import os
 from pathlib import Path
 import re
 import socket
@@ -19,15 +20,22 @@ def main():
     parser.add_argument('secondary_release')
     parser.add_argument('--workdir', type=Path)
     parser.add_argument('--timeout', type=int, default=240)
+    parser.add_argument('--secondary-source', type=Path,
+                        help='pre-change module source; secondary uses legacy module parameters')
     args = parser.parse_args()
-    work = args.workdir or Path(tempfile.mkdtemp(prefix='mars-replication-'))
+    work = args.workdir or Path(tempfile.mkdtemp(prefix='mars-replication-', dir=os.environ.get('TMPDIR', '/var/tmp')))
     if args.workdir:
         work.mkdir(parents=True, exist_ok=False)
     print(f'Artifacts: {work}', flush=True)
     for node, release in [('primary', args.primary_release), ('secondary', args.secondary_release)]:
+        extra = []
+        append = f'mars_test_node={node}'
+        if node == 'secondary' and args.secondary_source:
+            extra = ['--module-source', str(args.secondary_source)]
+            append += ' mars_test_legacy=1'
         subprocess.run([sys.executable, str(HERE / 'run.py'), release, '--prepare-only',
                         '--workdir', str(work / node), '--guest-script', str(HERE / 'replication.sh'),
-                        '--append', f'mars_test_node={node}'], check=True)
+                        '--append', append, *extra], check=True)
     # QEMU's socket transport forms a private Ethernet link; no TAP or root needed.
     with socket.socket() as sock:
         sock.bind(('127.0.0.1', 0))

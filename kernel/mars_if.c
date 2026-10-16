@@ -58,13 +58,15 @@
 #include <linux/bio.h>
 #include <linux/major.h>
 #include <linux/version.h>
-#if LINUX_VERSION_CODE < KERNEL_VERSION(7, 2, 0)
+#include <linux/idr.h>
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 18, 0)
 #include <linux/genhd.h>
 #endif
 #include <linux/blkdev.h>
 
 #include "mars.h"
 #include "mars_if.h"
+#include "mars_trace.h"
 #ifdef MARS_MODERN_KERNEL
 #undef USE_CONGESTED_FN
 #endif
@@ -101,8 +103,13 @@ struct if_hash_anchor {
 
 ///////////////////////// own static definitions ////////////////////////
 
-// TODO: check bounds, ensure that free minor numbers are recycled
-static int device_minor = 0;
+#ifdef MARS_MODERN_KERNEL
+static DEFINE_IDA(mars_minors);
+static int mars_major;
+#else
+static int device_minor;
+#define mars_major MARS_MAJOR
+#endif
 
 //////////////// object / aspect constructors / destructors ///////////////
 
@@ -196,8 +203,23 @@ void _call_bio_endio(struct if_brick *brick, struct bio *bio, int error)
 	get_real_lamport(&brick->completion_stamp);
 }
 
-/* callback
- */
+/* Keep the first error, including one from a non-final segment. */
+static void if_complete_biow(struct if_input *input, struct bio_wrapper *biow,
+			     int error)
+{
+	if (error < 0)
+		cmpxchg(&biow->error, 0, error);
+	if (!atomic_dec_and_test(&biow->bi_comp_cnt))
+		return;
+	error = READ_ONCE(biow->error);
+	_if_end_io_acct(input, biow);
+	if (error)
+		input->brick->error_code = error;
+	_call_bio_endio(input->brick, biow->bio, error);
+	brick_mem_free(biow);
+}
+
+/* callback */
 static
 void if_endio(struct generic_callback *cb)
 {
@@ -205,11 +227,10 @@ void if_endio(struct generic_callback *cb)
 	struct if_input *input;
 	struct if_brick *brick;
 	int k;
-	int error;
 
 	LAST_CALLBACK(cb);
 	if (unlikely(!mref_a || !mref_a->object)) {
-		MARS_FAT("mref_a = %px mref = %px, something is very wrong here!\n", mref_a, mref_a->object);
+		MARS_FAT("mref_a = %px mref = %px, something is very wrong here!\n", mref_a, mref_a ? mref_a->object : NULL);
 		return;
 	}
 	input = mref_a->input;
@@ -217,47 +238,20 @@ void if_endio(struct generic_callback *cb)
 
 	mars_trace(mref_a->object, "if_endio");
 	mars_log_trace(mref_a->object);
+	trace_mars_request(input->brick->brick_name, "complete", mref_a->object,
+			   mref_a->object->ref_pos, mref_a->object->ref_len,
+			   mref_a->object->ref_flags, CALLBACK_ERROR(mref_a->object));
 
-	MARS_IO("flags = %ux bio_count = %d\n", mref->ref_flags, mref_a->bio_count);
+	MARS_IO("flags = %ux bio_count = %d\n", mref_a->object->ref_flags, mref_a->bio_count);
 
 	for (k = 0; k < mref_a->bio_count; k++) {
 		struct bio_wrapper *biow;
-		struct bio *bio;
 
 		biow = mref_a->orig_biow[k];
 		mref_a->orig_biow[k] = NULL;
 		CHECK_PTR(biow, err);
 
-		CHECK_ATOMIC(&biow->bi_comp_cnt, 1);
-		if (!atomic_dec_and_test(&biow->bi_comp_cnt)) {
-			continue;
-		}
-
-		bio = biow->bio;
-		CHECK_PTR_NULL(bio, err);
-
-		_if_end_io_acct(input, biow);
-
-		error = CALLBACK_ERROR(mref_a->object);
-		if (unlikely(error < 0)) {
-			if (likely(input->brick))
-				input->brick->error_code = error;
-		} else { // bio conventions are slightly different...
-			error = 0;
-//      remove_this
-#ifdef MARS_HAS_BVEC_ITER
-//      end_remove_this
-			bio->bi_iter.bi_size = 0;
-//      remove_this
-#else
-			bio->bi_size = 0;
-#endif
-//      end_remove_this
-		}
-		MARS_IO("calling end_io() flags = %ux error = %d\n",
-			mref->ref_flags, error);
-		_call_bio_endio(input->brick, bio, error);
-		brick_mem_free(biow);
+		if_complete_biow(input, biow, CALLBACK_ERROR(mref_a->object));
 	}
 	brick = input->brick;
 	if (mref_a->object->ref_flags & MREF_WRITE) {
@@ -467,7 +461,7 @@ void if_make_request(struct request_queue *q, struct bio *bio)
 	const bool do_unplug = ALWAYS_UNPLUG | unplug | noidle;
 	const bool do_skip_sync = brick->skip_sync && !(barrier | syncio);
 
-	struct bio_wrapper *biow;
+	struct bio_wrapper *biow = NULL;
 	struct mref_object *mref = NULL;
 	struct if_mref_aspect *mref_a;
 //      remove_this
@@ -486,7 +480,6 @@ void if_make_request(struct request_queue *q, struct bio *bio)
 #endif
 //      end_remove_this
 	int kb = (total_len + 512) / 1024;
-	bool assigned = false;
         int error = -EINVAL;
 
 #ifdef CONFIG_MARS_DEBUG_DEVEL_VIA_SAY
@@ -559,16 +552,18 @@ void if_make_request(struct request_queue *q, struct bio *bio)
 #else
 	(void)ahead; // shut up gcc
 #endif
-	if (unlikely(discard)) { // NYI
-		error = 0;
-		_call_bio_endio(brick, bio, 0);
+	if (unlikely(discard)) {
+		error = -EOPNOTSUPP;
+		_call_bio_endio(brick, bio, error);
 		goto done;
 	}
 
+	error = -ENOMEM;
 	biow = brick_zmem_alloc(sizeof(struct bio_wrapper));
 	CHECK_PTR(biow, err);
 	biow->bio = bio;
-	atomic_set(&biow->bi_comp_cnt, 0);
+	/* Hold a construction reference while callbacks can run in parallel. */
+	atomic_set(&biow->bi_comp_cnt, 1);
 
 #ifdef CONFIG_MARS_DEBUG
 	if (rw) {
@@ -582,8 +577,9 @@ void if_make_request(struct request_queue *q, struct bio *bio)
 
 	/* FIXME: THIS IS PROVISIONARY (use event instead)
 	 */
-	while (unlikely(!brick->power.led_on)) {
-		brick_msleep(100);
+	if (unlikely(!brick->power.led_on)) {
+		error = -ESHUTDOWN;
+		goto err;
 	}
 
 	down(&input->kick_sem);
@@ -675,7 +671,6 @@ void if_make_request(struct request_queue *q, struct bio *bio)
 				CHECK_ATOMIC(&biow->bi_comp_cnt, 0);
 				atomic_inc(&biow->bi_comp_cnt);
 				mref_a->orig_biow[mref_a->bio_count++] = biow;
-				assigned = true;
 				goto unlock;
 			} // foreach hash collision list member
 
@@ -692,6 +687,7 @@ void if_make_request(struct request_queue *q, struct bio *bio)
 				}
 				mref_a = if_mref_get_aspect(brick, mref);
 				if (unlikely(!mref_a)) {
+					if_free_mref(mref);
 					up(&input->kick_sem);
 					goto err;
 				}
@@ -726,11 +722,14 @@ void if_make_request(struct request_queue *q, struct bio *bio)
 
 				error = GENERIC_INPUT_CALL(input, mref_get, mref);
 				if (unlikely(error < 0)) {
+					if_free_mref(mref);
 					up(&input->kick_sem);
 					goto err;
 				}
 				
 				mars_trace(mref, "if_start");
+				trace_mars_request(brick->brick_name, "submit", mref,
+						   mref->ref_pos, mref->ref_len, mref->ref_flags, 0);
 
 				this_len = mref->ref_len; // now may be shorter than originally requested.
 				mref_a->max_len = this_len;
@@ -750,7 +749,6 @@ void if_make_request(struct request_queue *q, struct bio *bio)
 				atomic_inc(&biow->bi_comp_cnt);
 				mref_a->orig_biow[0] = biow;
 				mref_a->bio_count = 1;
-				assigned = true;
 
 				/* When a bio with multiple biovecs is split into
 				 * multiple mrefs, only the last one should be
@@ -819,11 +817,11 @@ err:
 
 	if (error < 0) {
 		MARS_ERR("cannot submit request from bio, status=%d\n", error);
-		if (!assigned) {
-			brick->error_code = error;
-			_call_bio_endio(brick, bio, error);
-		}
 	}
+	if (biow)
+		if_complete_biow(input, biow, error);
+	else
+		_call_bio_endio(brick, bio, error);
 
 	if (do_unplug ||
 	   (brick && brick->max_plugged > 0 && atomic_read(&input->plugged_count) > brick->max_plugged)) {
@@ -973,23 +971,29 @@ int mars_merge_bvec(struct request_queue *q, struct bvec_merge_data *bvm, struct
 static
 loff_t if_get_capacity(struct if_brick *brick)
 {
-	/* Don't read always, read only when unknown.
-	 * brick->dev_size may be different from underlying sizes,
-	 * e.g. when the size symlink indicates a logically smaller
-	 * device than physically.
-	 */
-	if (brick->dev_size <= 0) {
-		struct if_input *input = brick->inputs[0];
-		int status;
+	struct if_input *input = brick->inputs[0];
+	int status = GENERIC_INPUT_CALL(input, mars_get_info, &brick->info);
+	unsigned int logical, physical;
 
-		status = GENERIC_INPUT_CALL(input, mars_get_info, &brick->info);
-		if (unlikely(status < 0)) {
-			MARS_ERR("cannot get device info, status=%d\n", status);
-			return 0;
-		}
-		MARS_INF("determined default capacity: %lld bytes\n", brick->info.current_size);
+	if (status < 0)
+		return status;
+	logical = max(512, brick->info.xf_logical_block_size ?: brick->info.tf_min_size);
+	physical = max(512, brick->info.xf_physical_block_size ?: brick->info.tf_align);
+	if (!is_power_of_2(logical) || logical > MARS_MAX_SEGMENT_SIZE)
+		return -EINVAL;
+	if (brick->info.xf_logical_block_size < 0 || brick->info.xf_physical_block_size < 0 ||
+	    brick->info.tf_min_size < 0 || brick->info.tf_align < 0 ||
+	    !is_power_of_2(physical) || physical < logical ||
+	    brick->info.xf_alignment_offset < 0 || brick->info.xf_alignment_offset >= physical ||
+	    brick->info.xf_io_min < 0 || brick->info.xf_io_opt < 0 ||
+	    !IS_ALIGNED(brick->info.xf_io_min, logical) ||
+	    !IS_ALIGNED(brick->info.xf_io_opt, logical))
+		return -EINVAL;
+	if (brick->dev_size <= 0)
 		brick->dev_size = brick->info.current_size;
-	}
+	if (brick->dev_size <= 0 || brick->dev_size > brick->info.current_size ||
+	    !IS_ALIGNED(brick->dev_size, logical))
+		return -EINVAL;
 	return brick->dev_size;
 }
 
@@ -1066,22 +1070,36 @@ static int if_switch(struct if_brick *brick)
 			/* first get rid of the previous device */
 			goto go_down;
 		}
+		capacity = if_get_capacity(brick);
+		if (capacity <= 0) {
+			status = capacity ?: -EINVAL;
+			MARS_ERR("invalid backing geometry or capacity: %d\n", status);
+			goto is_down;
+		}
 
 		status = -ENOMEM;
 #ifdef MARS_MODERN_KERNEL
 		{
-			/* Every completed write is durable; advertise no write cache.
-			 * Discard/write-zeroes are unsupported and remain unadvertised.
-			 */
+			/* Completion includes the durable log; no volatile write cache. */
 			struct queue_limits lim = {
-				.logical_block_size = max(512, brick->info.tf_min_size),
-				.physical_block_size = max(512, brick->info.tf_align),
+				.logical_block_size = max(512, brick->info.xf_logical_block_size ?: brick->info.tf_min_size),
+				.physical_block_size = max(512, brick->info.xf_physical_block_size ?: brick->info.tf_align),
+				.alignment_offset = brick->info.xf_alignment_offset,
+				.io_min = brick->info.xf_io_min,
+				.io_opt = brick->info.xf_io_opt,
 				.max_hw_sectors = MARS_MAX_SEGMENT_SIZE >> 9,
+				.max_discard_sectors = MARS_MAX_SEGMENT_SIZE >> 9,
+				.max_hw_discard_sectors = MARS_MAX_SEGMENT_SIZE >> 9,
+				.max_discard_segments = 1,
+				.max_write_zeroes_sectors = MARS_MAX_SEGMENT_SIZE >> 9,
+				.discard_granularity = max(512, brick->info.xf_logical_block_size ?: brick->info.tf_min_size),
 				.max_segments = 1,
 				.max_segment_size = MARS_MAX_SEGMENT_SIZE,
 				.seg_boundary_mask = PAGE_SIZE - 1,
 				.features = BLK_FEAT_SYNCHRONOUS | BLK_FEAT_IO_STAT,
 			};
+			if (!brick->info.xf_nonrot)
+				lim.features |= BLK_FEAT_ROTATIONAL;
 
 			disk = blk_alloc_disk(&lim, NUMA_NO_NODE);
 			if (IS_ERR(disk)) {
@@ -1110,18 +1128,27 @@ static int if_switch(struct if_brick *brick)
 		}
 
 #endif
-		minor = device_minor++; //TODO: protect against races (e.g. atomic_t)
+#ifdef MARS_MODERN_KERNEL
+		minor = ida_alloc_range(&mars_minors, 0, MINORMASK, GFP_KERNEL);
+		if (minor < 0) {
+			status = minor;
+			input->q = NULL;
+			put_disk(disk);
+			goto is_down;
+		}
+#else
+		minor = device_minor++;
+#endif
 		set_disk_ro(disk, true);
 
 		disk->queue = q;
-		disk->major = MARS_MAJOR; //TODO: make this dynamic for >256 devices
+		disk->major = mars_major;
 		disk->first_minor = minor;
 		disk->fops = &if_blkdev_ops;
 		snprintf(disk->disk_name, sizeof(disk->disk_name),  "mars/%s", brick->brick_name);
 		disk->private_data = input;
 		input->disk = disk;
 		smp_mb();
-		capacity = if_get_capacity(brick);
 		MARS_DBG("created device name %s, capacity=%lld\n", disk->disk_name, capacity);
 		if_set_capacity(input, capacity);
 		
@@ -1244,6 +1271,7 @@ static int if_switch(struct if_brick *brick)
 #ifdef MARS_MODERN_KERNEL
 		status = add_disk(disk);
 		if (status) {
+			ida_free(&mars_minors, minor);
 			input->bdev = NULL;
 			input->disk = NULL;
 			input->q = NULL;
@@ -1323,6 +1351,7 @@ static int if_switch(struct if_brick *brick)
 		}
 #else
 		input->bdev = NULL;
+		ida_free(&mars_minors, disk->first_minor);
 #endif
 		MARS_DBG("calling put_disk()\n");
 		put_disk(disk);
@@ -1443,15 +1472,94 @@ if_release(struct gendisk *gd, fmode_t mode)
 }
 
 #ifdef MARS_MODERN_KERNEL
+/* Discard uses a zero payload so existing log readers and older peers can
+ * replay it safely. The optional hint lets new backends reclaim the range.
+ */
+static void if_submit_zeroes(struct bio *bio)
+{
+	struct if_input *input = bdev_get_queue(bio->bi_bdev)->queuedata;
+	struct if_brick *brick = input->brick;
+	struct bio_wrapper *biow;
+	loff_t pos = (loff_t)bio->bi_iter.bi_sector << 9;
+	unsigned int remaining = bio->bi_iter.bi_size;
+	int error = 0;
+
+	_if_unplug(input);
+	if (!brick->power.led_on) {
+		_call_bio_endio(brick, bio, -ESHUTDOWN);
+		return;
+	}
+	biow = brick_zmem_alloc(sizeof(*biow));
+	if (!biow) {
+		_call_bio_endio(brick, bio, -ENOMEM);
+		return;
+	}
+	biow->bio = bio;
+	atomic_set(&biow->bi_comp_cnt, 1);
+	_if_start_io_acct(input, biow);
+	while (remaining) {
+		struct mref_object *mref = if_alloc_mref(brick);
+		struct if_mref_aspect *aspect;
+		unsigned int len;
+
+		if (!mref) {
+			error = -ENOMEM;
+			break;
+		}
+		aspect = if_mref_get_aspect(brick, mref);
+		if (!aspect) {
+			if_free_mref(mref);
+			error = -ENOMEM;
+			break;
+		}
+		mref->ref_pos = pos;
+		mref->ref_len = min_t(unsigned int, remaining, PAGE_SIZE);
+		mref->ref_flags = MREF_WRITE | MREF_MAY_WRITE;
+		if (bio_op(bio) == REQ_OP_DISCARD)
+			mref->ref_flags |= MREF_DISCARD;
+		error = GENERIC_INPUT_CALL(input, mref_get, mref);
+		if (error < 0) {
+			if_free_mref(mref);
+			break;
+		}
+		len = mref->ref_len;
+		if (!len || len > remaining || !mref->ref_data) {
+			GENERIC_INPUT_CALL_VOID(input, mref_put, mref);
+			error = -EIO;
+			break;
+		}
+		memset(mref->ref_data, 0, len);
+		aspect->input = input;
+		aspect->bio_count = 1;
+		aspect->orig_biow[0] = biow;
+		SETUP_CALLBACK(mref, if_endio, aspect);
+		atomic_inc(&biow->bi_comp_cnt);
+		atomic_inc(&brick->write_flying_count);
+		trace_mars_request(brick->brick_name, "submit_zeroes", mref,
+				   pos, len, mref->ref_flags, 0);
+		GENERIC_INPUT_CALL_VOID(input, mref_io, mref);
+		GENERIC_INPUT_CALL_VOID(input, mref_put, mref);
+		pos += len;
+		remaining -= len;
+		error = 0;
+	}
+	if_complete_biow(input, biow, error);
+}
+
 static void if_submit_bio(struct bio *bio)
 {
-	if (bio_op(bio) != REQ_OP_READ && bio_op(bio) != REQ_OP_WRITE) {
+	if (bio_op(bio) != REQ_OP_READ && bio_op(bio) != REQ_OP_WRITE &&
+	    bio_op(bio) != REQ_OP_DISCARD && bio_op(bio) != REQ_OP_WRITE_ZEROES) {
 		bio->bi_status = BLK_STS_NOTSUPP;
 		bio_endio(bio);
 		return;
 	}
 	bio = bio_split_to_limits(bio);
-	if (bio)
+	if (!bio)
+		return;
+	if (bio_op(bio) == REQ_OP_DISCARD || bio_op(bio) == REQ_OP_WRITE_ZEROES)
+		if_submit_zeroes(bio);
+	else
 		if_make_request(bdev_get_queue(bio->bi_bdev), bio);
 }
 #endif
@@ -1667,7 +1775,10 @@ void exit_mars_if(void)
 	int status;
 	MARS_INF("exit_if()\n");
 	status = if_unregister_brick_type();
-	unregister_blkdev(MARS_MAJOR, "mars");
+	unregister_blkdev(mars_major, "mars");
+#ifdef MARS_MODERN_KERNEL
+	ida_destroy(&mars_minors);
+#endif
 }
 
 int __init init_mars_if(void)
@@ -1677,9 +1788,12 @@ int __init init_mars_if(void)
 	(void)if_aspect_types; // not used, shut up gcc
 
 	MARS_INF("init_if()\n");
-	status = register_blkdev(MARS_MAJOR, "mars");
-	if (status)
+	status = register_blkdev(mars_major, "mars");
+	if (status < 0)
 		return status;
+#ifdef MARS_MODERN_KERNEL
+	mars_major = status;
+#endif
 	status = if_register_brick_type();
 	if (status)
 		goto err_device;

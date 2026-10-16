@@ -46,8 +46,31 @@ ls -l /dev/mars /sys/block
 test -b /dev/mars/test
 chmod 0600 /dev/mars/test
 test "$(blockdev --getsize64 /dev/mars/test)" = 134217728
+test "$(blockdev --getss /dev/mars/test)" = "$(blockdev --getss /dev/vdb)"
+test "$(blockdev --getpbsz /dev/mars/test)" = "$(blockdev --getpbsz /dev/vdb)"
+mkdir -p /sys/kernel/tracing
+mount -t tracefs tracefs /sys/kernel/tracing
+echo 1 >/sys/kernel/tracing/events/mars/enable
 dd if=/dev/urandom of=/tmp/pattern bs=4096 count=256 status=none
 dd if=/tmp/pattern of=/dev/mars/test bs=4096 conv=fsync status=none
+dd if=/dev/mars/test of=/tmp/readback bs=4096 count=256 iflag=direct status=none
+cmp /tmp/pattern /tmp/readback
+# Exercise deallocation, overlap with a later write, adjacent data and zeroout.
+blkdiscard -o 262144 -l 262144 /dev/mars/test
+dd if=/dev/zero of=/tmp/pattern bs=4096 seek=64 count=64 conv=notrunc status=none
+dd if=/dev/urandom of=/tmp/rewrite bs=4096 count=2 status=none
+dd if=/tmp/rewrite of=/dev/mars/test bs=4096 seek=80 conv=fsync,notrunc status=none
+dd if=/tmp/rewrite of=/tmp/pattern bs=4096 seek=80 conv=notrunc status=none
+blkdiscard -z -o 786432 -l 32768 /dev/mars/test
+dd if=/dev/zero of=/tmp/pattern bs=4096 seek=192 count=8 conv=notrunc status=none
+if [ "$(blockdev --getss /dev/mars/test)" = 512 ]; then
+    blkdiscard -o 5632 -l 1536 /dev/mars/test
+    dd if=/dev/zero of=/tmp/pattern bs=512 seek=11 count=3 conv=notrunc status=none
+else
+    # Use the raw x86 Linux BLKDISCARD ioctl: blkdiscard(8) can clamp ranges.
+    perl -MFcntl=O_RDWR -e 'sysopen(my $f,$ARGV[0],O_RDWR) or die $!; my $r=pack("QQ",512,512); ioctl($f,0x1277,$r) and die "unaligned discard accepted"' /dev/mars/test
+fi
+perl -MFcntl=O_RDWR -e 'sysopen(my $f,$ARGV[0],O_RDWR) or die $!; my $r=pack("QQ",134217728,4096); ioctl($f,0x1277,$r) and die "out-of-range discard accepted"' /dev/mars/test
 dd if=/dev/mars/test of=/tmp/readback bs=4096 count=256 iflag=direct status=none
 cmp /tmp/pattern /tmp/readback
 for i in {1..30}; do
@@ -56,9 +79,15 @@ for i in {1..30}; do
 done
 timeout 90 marsadm secondary test
 timeout 90 marsadm down test
+if [ "$(cat /sys/block/vdb/queue/discard_max_bytes)" != 0 ]; then
+    grep 'phase=discard.*error=0' /sys/kernel/tracing/trace
+else
+    grep 'phase=discard.*error=-95' /sys/kernel/tracing/trace
+fi
 rmmod mars
 dd if=/dev/vdb of=/tmp/backing bs=4096 count=256 iflag=direct status=none
 cmp /tmp/pattern /tmp/backing
+echo MARS_QEMU_DISCARD_PASS
 echo MARS_QEMU_BLOCK_PASS
 modprobe mars
 cat /proc/sys/mars/version
@@ -73,6 +102,10 @@ mkfs.ext4 -q -F -E nodiscard /dev/mars/test
 mount /dev/mars/test /mnt
 dd if=/tmp/pattern of=/mnt/pattern bs=1M conv=fsync status=none
 cmp /tmp/pattern /mnt/pattern
+dd if=/tmp/pattern of=/mnt/to-delete bs=1M conv=fsync status=none
+rm /mnt/to-delete
+fstrim -v -l 16777216 /mnt
+cmp /tmp/pattern /mnt/pattern
 umount /mnt
 for i in {1..30}; do
     [ "$(readlink /mars/resource-test/actual-mars-test/open-count)" = 0 ] && break
@@ -85,5 +118,6 @@ mount -o ro,noload /dev/vdb /mnt
 cmp /tmp/pattern /mnt/pattern
 umount /mnt
 echo MARS_QEMU_FILESYSTEM_PASS
+echo MARS_QEMU_FSTRIM_PASS
 echo MARS_QEMU_PASS
 poweroff

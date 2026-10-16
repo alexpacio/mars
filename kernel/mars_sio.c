@@ -40,6 +40,7 @@
 #include <linux/spinlock.h>
 #include <linux/wait.h>
 #include <linux/splice.h>
+#include <linux/falloc.h>
 
 #include "brick_wait.h"
 #include "mars.h"
@@ -47,6 +48,7 @@
 ///////////////////////// own type definitions ////////////////////////
 
 #include "mars_sio.h"
+#include "mars_trace.h"
 
 ////////////////// own brick / input / output operations //////////////////
 
@@ -162,6 +164,34 @@ int write_aops(struct sio_output *output, struct mref_object *mref)
 	void *data = mref->ref_data;
 	int  len = mref->ref_len;
 	int ret = 0;
+
+#ifdef MARS_MODERN_KERNEL
+	if (mref->ref_flags & MREF_DISCARD) {
+		if (pos < 0 || len <= 0 || !data || memchr_inv(data, 0, len))
+			return -EBADMSG;
+		if (S_ISBLK(file_inode(file)->i_mode)) {
+			struct block_device *bdev = mars_file_bdev(file);
+			unsigned int logical = bdev_logical_block_size(bdev);
+
+			if (pos < 0 || len <= 0 || !IS_ALIGNED(pos, logical) ||
+			    !IS_ALIGNED(len, logical))
+				return -EINVAL;
+			ret = bdev_get_queue(bdev)->limits.max_discard_sectors ?
+				blkdev_issue_discard(bdev, pos >> 9, len >> 9, GFP_NOIO) : -EOPNOTSUPP;
+			if (!ret)
+				ret = blkdev_issue_flush(bdev);
+		} else {
+			ret = vfs_fallocate(file, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
+					    pos, len);
+		}
+		trace_mars_request(output->brick->brick_name, "punch_hole", mref,
+				   pos, len, mref->ref_flags, ret);
+		if (!ret)
+			return len; /* _sio_ref_io still fsyncs before completion. */
+		if (ret != -EOPNOTSUPP && ret != -ENOSYS)
+			return ret;
+	}
+#endif
 
 #ifdef MARS_HAS_KERNEL_READ
 	ret = kernel_write(file,
@@ -543,6 +573,22 @@ static int sio_get_info(struct sio_output *output, struct mars_info *info)
 
 	info->tf_align = 1;
 	info->tf_min_size = 1;
+#ifdef MARS_MODERN_KERNEL
+	if (S_ISBLK(file_inode(file)->i_mode)) {
+		struct block_device *bdev = mars_file_bdev(file);
+		struct request_queue *q = bdev_get_queue(bdev);
+
+		info->tf_align = queue_physical_block_size(q);
+		info->tf_min_size = queue_logical_block_size(q);
+		info->xf_physical_block_size = info->tf_align;
+		info->xf_logical_block_size = info->tf_min_size;
+		info->xf_alignment_offset = bdev_alignment_offset(bdev);
+		info->xf_io_min = queue_io_min(q);
+		info->xf_io_opt = queue_io_opt(q);
+		info->xf_discard_enabled = q->limits.max_discard_sectors != 0;
+		info->xf_nonrot = !(q->limits.features & BLK_FEAT_ROTATIONAL);
+	}
+#endif
 	info->current_size = i_size_read(file->f_mapping->host);
 	MARS_DBG("determined file size = %lld\n", info->current_size);
 	return 0;

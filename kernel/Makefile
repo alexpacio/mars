@@ -1,41 +1,29 @@
-#
-# Makefile for out-of-tree build of MARS module
-#
-#
-# By Benjamin Kübler <benjamin.kuebler@1und1.de>
-#
-# usage make [ KDIR =/path/to/kernel/source ]
-
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Canonical external module build; also used by distribution/DKMS packages.
+# Normalize an empty CI variable before the kernel probes compiler flags.
+ifeq ($(strip $(SOURCE_DATE_EPOCH)),)
+unexport SOURCE_DATE_EPOCH
+endif
 ifneq ($(KERNELRELEASE),)
-
-# in-tree-build process
-include Kbuild
-
+include $(src)/Kbuild
 else
-# out-of-tree-build process
-
 MARSSRC := $(CURDIR)
-DESTDIR ?= /
-KDIR ?= /lib/modules/`uname -r`/build
+KDIR ?= /lib/modules/$(shell uname -r)/build
+DESTDIR ?=
 
-.PHONY: greeting install default clean config
+.PHONY: all default check-kernel install clean
+all default: check-kernel
+	$(MAKE) -C "$(KDIR)" M="$(MARSSRC)" modules
 
-default: greeting 
-	$(MAKE) -C $(KDIR) M=$(MARSSRC) modules
-
-greeting:
-	@echo "Building MARS Module again: KDIR=$(KDIR)" ;
-	@if ! test -e $(KDIR)/Makefile ; then \
-		echo -e "Sorry, kernel makefile not found. You need to tell me a correct KDIR!\n" ; \
-		false; \
-	fi
+check-kernel:
+	@test -r "$(KDIR)/Makefile" -a -r "$(KDIR)/.config" || \
+	    { echo "Set KDIR to configured kernel headers with Makefile and .config" >&2; exit 1; }
+	@test -r "$(KDIR)/Module.symvers" || \
+	    { echo "Missing $(KDIR)/Module.symvers: build the target kernel first" >&2; exit 1; }
 
 clean:
-	$(MAKE) -C $(KDIR) M=$(MARSSRC) clean
+	$(MAKE) -C "$(KDIR)" M="$(MARSSRC)" clean
 
-config:
-	$(MAKE) -C $(KDIR) M=$(MARSSRC) config
-
-install:
-	$(MAKE) -C $(KDIR) M=$(MARSSRC) modules_install
+install: check-kernel
+	$(MAKE) -C "$(KDIR)" M="$(MARSSRC)" INSTALL_MOD_PATH="$(DESTDIR)" modules_install
 endif

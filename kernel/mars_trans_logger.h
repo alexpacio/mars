@@ -198,6 +198,7 @@ struct trans_logger_brick {
 	bool stopped_logging; // direct IO without logging (only in case of EMERGENCY)
 	// private
 	int disk_io_error;         // replay errors from callbacks
+	int fatal_error;           // first logging/writeback error; cleared by reconstruction only
 	struct trans_logger_hash_anchor **hash_table;
 	struct list_head group_head;
 	loff_t old_margin;

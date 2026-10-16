@@ -25,6 +25,7 @@
 #define MARS_SERVER_H
 
 #include <linux/wait.h>
+#include <linux/completion.h>
 
 #include "mars_net.h"
 #include "lib_limiter.h"
@@ -64,6 +65,8 @@ struct server_brick {
 	const char *switch_path;
 	unsigned long shutdown_jiffies;
 	wait_queue_head_t startup_event;
+	struct completion handler_start;
+	struct completion cb_start;
 	wait_queue_head_t cb_event;
 	struct mutex cb_mutex;
 	struct list_head cb_list;

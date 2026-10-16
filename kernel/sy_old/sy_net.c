@@ -32,6 +32,7 @@
 
 #include "strategy.h"
 #include "../mars_net.h"
+#include "../mars_net_validation.h"
 
 static
 char *_mars_translate_hostname(const char *name)
@@ -90,9 +91,42 @@ int mars_send_dent_list(struct mars_global *global, struct mars_socket *sock)
 }
 EXPORT_SYMBOL_GPL(mars_send_dent_list);
 
+/* A peer is a cluster administrator, not an unrestricted host filesystem
+ * writer. Validate pulled metadata before it enters the local merge queue.
+ */
+static bool received_dent_valid(const struct mars_dent *dent)
+{
+	const struct kstat *st = &dent->new_stat;
+	const char *leaf;
+
+	if (!mars_net_path_valid(dent->d_path, false) ||
+	    (strcmp(dent->d_path, "/mars") && strncmp(dent->d_path, "/mars/", 6)))
+		return false;
+	leaf = strrchr(dent->d_path, '/') + 1;
+	if (!dent->d_name || strcmp(leaf, dent->d_name) ||
+	    dent->d_proto < 0 || dent->d_proto > 255 ||
+	    /* -1 is the legacy "no mapfree handle" size-correction sentinel. */
+	    dent->d_corr_A < -1 || dent->d_corr_B < -1 || st->size < 0 ||
+	    st->mtime.tv_sec < 0 || st->mtime.tv_nsec < 0 || st->mtime.tv_nsec >= NSEC_PER_SEC ||
+	    st->ctime.tv_sec < 0 || st->ctime.tv_nsec < 0 || st->ctime.tv_nsec >= NSEC_PER_SEC)
+		return false;
+	/* Protected entries occur in ordinary full snapshots. The merge skips
+	 * them rather than rejecting a legitimate peer's entire snapshot.
+	 */
+	if (S_ISLNK(st->mode) && mars_net_link_mutable(dent->d_path, my_id()) &&
+	    !mars_net_link_target_valid(dent->new_link))
+		return false;
+	return true;
+}
+
+#define MARS_NET_DENT_MAX 65536
+#define MARS_NET_DENT_BYTES_MAX (32 * 1024 * 1024)
+
 int mars_recv_dent_list(struct mars_global *global, struct mars_socket *sock)
 {
 	struct list_head *anchor;
+	size_t bytes = 0;
+	unsigned int count = 0;
 	int status;
 
 	down_write(&global->dent_mutex);
@@ -100,8 +134,13 @@ int mars_recv_dent_list(struct mars_global *global, struct mars_socket *sock)
 	for (;;) {
 		struct mars_dent *dent = brick_zmem_alloc(sizeof(struct mars_dent));
 		struct list_head *hash_anchor;
+		const struct meta *meta;
 		unsigned int hash;
 
+		if (!dent) {
+			status = -ENOMEM;
+			goto done;
+		}
 		INIT_LIST_HEAD(&dent->dent_link);
 		INIT_LIST_HEAD(&dent->dent_hash_link);
 		INIT_LIST_HEAD(&dent->brick_list);
@@ -109,6 +148,23 @@ int mars_recv_dent_list(struct mars_global *global, struct mars_socket *sock)
 		status = mars_recv_struct(sock, dent, mars_dent_meta);
 		if (status <= 0) {
 			mars_free_dent(NULL, dent);
+			goto done;
+		}
+		bytes += sizeof(*dent);
+		for (meta = mars_dent_meta; meta->field_name; meta++) {
+			const char *value;
+
+			if (meta->field_type != FIELD_STRING)
+				continue;
+			value = *(char **)((char *)dent + meta->field_offset);
+			if (value)
+				bytes += strlen(value) + 1;
+		}
+		if (++count > MARS_NET_DENT_MAX || bytes > MARS_NET_DENT_BYTES_MAX ||
+		    !received_dent_valid(dent)) {
+			MARS_WRN("rejecting invalid or oversized peer metadata list\n");
+			mars_free_dent(NULL, dent);
+			status = -EPROTO;
 			goto done;
 		}
 		if (dent->d_proto >= 2) {

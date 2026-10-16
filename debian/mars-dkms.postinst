@@ -8,14 +8,12 @@ case "$1" in
     ;;
 
     configure|reconfigure)
-        # Restart procps to reload sysctl.d files
-        invoke-rc.d procps restart
         # Get the version of the current loaded module:
         old_version="$(cat /sys/module/mars/version 2>/dev/null)" || exit 0
         # Get the version of the latest available module:
         new_version="$(modinfo -F version mars 2>/dev/null)" || exit 0
-        # See if the new one is actually newer:
-        dpkg --compare-versions "$old_version" lt "$new_version" || exit 0
+        # Build metadata is not a Debian version string.
+        [ "$old_version" != "$new_version" ] || exit 0
         # Trigger an update notification that recommends a reboot:
         touch /run/reboot-required || true
         grep -Fqsx mars-dkms /run/reboot-required.pkgs || \

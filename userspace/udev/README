@@ -1,26 +1,11 @@
-TST August 2014
+The Debian tools package installs 65-mars.rules in /usr/lib/udev/rules.d.
+For a manual installation, copy it there and run udevadm control --reload.
 
-On some distros / versions, udev rules for MARS are needed.
+Modern kernels expose the sysfs disk name as mars!RESOURCE while devtmpfs
+creates /dev/mars/RESOURCE. The rule matches this escaped name and restricts
+access to root (0600). Administrators can override permissions in a later
+site-specific rule. No RUN helper modifies unrelated device paths.
 
-Without any udev rules, /dev/mars/mydata is created with the sticky bit set.
-As a result, the device will not vanish when leaving primary state.
-
-In turn, some commands like "marsadm secondary" will complain about that
-by means of timeouts.
-
-On other distros / versions, catch-all rules are present which _would_
-prevent the sticky bit problem. However, some syntax errors prevent this.
-
-This directory contains distro- and version-dependent stuff. I did not have
-the time to fully analyze all distros / distro versions and their udev
-rules.
-
-Since I am not an expert in writing udev rules (and I just needed
-a quickfix for my own work), the files in this directory should
-be regarded as examples.
-
-For example, the file 65-mars.rules should be copied to /lib/udev/rules.d/
-on some newer Debian distros. OTOH, some elder Debians don't seem to
-need this (but may need debian-udev.patch).
-
-Distro maintainers should improve on this and/or provide better solutions.
+During disposable guest validation, promote a resource, trigger/settle udev,
+inspect the node's path and mode, then demote and confirm it disappears.
+The old debian-udev.patch is retained only as a historical reference.

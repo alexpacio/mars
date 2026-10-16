@@ -44,6 +44,7 @@
 #include "lib_limiter.h"
 
 #include "mars_bio.h"
+#include "mars_trace.h"
 
 int bio_nr_requests = 1024;
 
@@ -320,6 +321,15 @@ static int bio_get_info(struct bio_output *output, struct mars_info *info)
 	if (q) {
 		info->tf_align = queue_physical_block_size(q);
 		info->tf_min_size = queue_logical_block_size(q);
+#ifdef MARS_MODERN_KERNEL
+		info->xf_physical_block_size = info->tf_align;
+		info->xf_logical_block_size = info->tf_min_size;
+		info->xf_alignment_offset = bdev_alignment_offset(mars_file_bdev(brick->mf->mf_filp));
+		info->xf_io_min = queue_io_min(q);
+		info->xf_io_opt = queue_io_opt(q);
+		info->xf_discard_enabled = q->limits.max_discard_sectors != 0;
+		info->xf_nonrot = !(q->limits.features & BLK_FEAT_ROTATIONAL);
+#endif
 	}
 	brick->total_size = i_size_read(inode);
 	info->current_size = brick->total_size;
@@ -497,6 +507,33 @@ void _bio_ref_io(struct bio_output *output, struct mref_object *mref, bool cork)
 	list_add_tail(&mref_a->io_head, &brick->submitted_list[rw & 1]);
 	spin_unlock_irqrestore(&brick->lock, flags);
 
+#ifdef MARS_MODERN_KERNEL
+	if (mref->ref_flags & MREF_DISCARD) {
+		struct block_device *bdev = bio->bi_bdev;
+
+		/* The fallback payload is also checked for remote requests. */
+		if (!(mref->ref_flags & MREF_WRITE) ||
+		    memchr_inv(mref->ref_data, 0, mref->ref_len)) {
+			status = -EBADMSG;
+		} else if (!bdev_get_queue(bdev)->limits.max_discard_sectors) {
+			status = -EOPNOTSUPP;
+		} else {
+			status = blkdev_issue_discard(bdev, mref->ref_pos >> 9,
+						     mref->ref_len >> 9, GFP_NOIO);
+			if (!status)
+				status = blkdev_issue_flush(bdev);
+		}
+		trace_mars_request(brick->brick_name, "discard", mref,
+				   mref->ref_pos, mref->ref_len, mref->ref_flags, status);
+		if (status != -EOPNOTSUPP) {
+			bio->bi_status = errno_to_blk_status(status);
+			bio_callback(bio);
+			goto done;
+		}
+		/* Backends without deallocation support receive the logged zeroes. */
+	}
+#endif
+
 #ifdef FAKE_IO
 	bio->bi_end_io(bio, 0);
 #else
@@ -582,7 +619,8 @@ void bio_ref_io(struct bio_output *output, struct mref_object *mref)
 	_mref_get(mref);
 	atomic_inc(&mars_global_io_flying);
 
-	if (mref->ref_prio == MARS_PRIO_LOW ||
+	if ((mref->ref_flags & MREF_DISCARD) ||
+	    mref->ref_prio == MARS_PRIO_LOW ||
 	    (mref->ref_prio == MARS_PRIO_NORMAL &&
 	     (mref->ref_flags & MREF_WRITE))) {
 		struct bio_mref_aspect *mref_a = bio_mref_get_aspect(output->brick, mref);

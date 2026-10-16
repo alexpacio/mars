@@ -1,0 +1,20 @@
+[Unit]
+Description=MARS replicated block devices
+Documentation=file:/usr/share/doc/mars-tools/modern-kernel.rst.gz
+Wants=network-online.target
+After=network-online.target
+RequiresMountsFor=/mars
+ConditionPathIsMountPoint=/mars
+ConditionPathIsSymbolicLink=/mars/uuid
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/sbin/modprobe mars
+# Demotion waits until resources are no longer in use. Never force removal.
+ExecStop=/usr/sbin/marsadm down all
+ExecStop=/sbin/modprobe -r mars
+TimeoutStopSec=300
+
+[Install]
+WantedBy=multi-user.target

@@ -33,6 +33,8 @@
 
 #include "lib_log.h"
 #include "brick_wait.h"
+#include "mars_trace.h"
+#include <linux/refcount.h>
 
 __u32 enabled_log_compressions = 0;
 
@@ -84,7 +86,7 @@ struct log_cb_info {
 	struct mref_object *mref;
 	struct log_status *logst;
 	struct semaphore mutex;
-	atomic_t refcount;
+	refcount_t refcount;
 	int nr_cb;
 	void (*endios[MARS_LOG_CB_MAX])(void *private, int error);
 	void *privates[MARS_LOG_CB_MAX];
@@ -93,7 +95,7 @@ struct log_cb_info {
 static
 void put_log_cb_info(struct log_cb_info *cb_info)
 {
-	if (atomic_dec_and_test(&cb_info->refcount)) {
+	if (refcount_dec_and_test(&cb_info->refcount)) {
 		brick_mem_free(cb_info);
 	}
 }
@@ -102,16 +104,16 @@ static
 void _do_callbacks(struct log_cb_info *cb_info, int error)
 {
 	int i;
-	down(&cb_info->mutex);
 	for (i = 0; i < cb_info->nr_cb; i++) {
 		void (*end_fn)(void *private, int error);
+		down(&cb_info->mutex);
 		end_fn = cb_info->endios[i];
 		cb_info->endios[i] = NULL;
+		up(&cb_info->mutex);
 		if (end_fn) {
 			end_fn(cb_info->privates[i], error);
 		}
 	}
-	up(&cb_info->mutex);
 }
 
 static
@@ -132,6 +134,10 @@ void log_write_endio(struct generic_callback *cb)
 	CHECK_PTR(logst, done);
 
 	MARS_IO("nr_cb = %d\n", cb_info->nr_cb);
+	if (cb->cb_error < 0)
+		cmpxchg(&logst->posix_error_code, 0, cb->cb_error);
+	trace_mars_log(logst->brick->brick_name, "complete",
+		       cb_info->mref->ref_pos, cb_info->mref->ref_len, cb->cb_error);
 
 	_do_callbacks(cb_info, cb->cb_error);
 
@@ -165,6 +171,8 @@ int log_compress(struct log_status *logst, int len,
 
 	compr_len = len + compress_overhead;
 	compr_buf = brick_mem_alloc(compr_len);
+	if (!compr_buf)
+		return 0;
 	inplace_buf = mref->ref_data + logst->payload_offset;
 
 	res = mars_compress(inplace_buf, len,
@@ -228,6 +236,8 @@ void log_flush(struct log_status *logst)
 	mref->ref_flags |= MREF_WRITE | MREF_MAY_WRITE;
 
 	mars_trace(mref, "log_flush");
+	trace_mars_log(logst->brick->brick_name, "submit",
+		       mref->ref_pos, mref->ref_len, 0);
 
 	atomic_inc(&logst->mref_flying);
 	atomic_inc(&global_mref_flying);
@@ -251,7 +261,11 @@ void *log_reserve(struct log_status *logst, struct log_header *lh)
 	void *data;
 	short total_len = lh->l_len + OVERHEAD;
 	int offset;
-	int status;
+	int status = -EINVAL;
+	int attempt;
+
+	if (READ_ONCE(logst->posix_error_code) < 0)
+		return NULL;
 
 	if (unlikely(lh->l_len <= 0 || lh->l_len > logst->max_size)) {
 		MARS_ERR("trying to write %d bytes, max allowed = %d\n", lh->l_len, logst->max_size);
@@ -264,6 +278,8 @@ void *log_reserve(struct log_status *logst, struct log_header *lh)
 	if ((mref && total_len > mref->ref_len - logst->offset)
 	   || !cb_info || cb_info->nr_cb >= MARS_LOG_CB_MAX) {
 		log_flush(logst);
+		if (READ_ONCE(logst->posix_error_code) < 0)
+			return NULL;
 	}
 
 	mref = logst->log_mref;
@@ -275,16 +291,18 @@ void *log_reserve(struct log_status *logst, struct log_header *lh)
 		logst->private = brick_zmem_alloc(sizeof(struct log_cb_info));
 		if (unlikely(!logst->private)) {
 			MARS_ERR("no memory\n");
+			status = -ENOMEM;
 			goto err;
 		}
 		cb_info = logst->private;
 		sema_init(&cb_info->mutex, 1);
-		atomic_set(&cb_info->refcount, 2);
+		refcount_set(&cb_info->refcount, 2);
 
 		mref = mars_alloc_mref(logst->brick);
 		if (unlikely(!mref)) {
 			MARS_ERR("no mref\n");
-			goto err;
+			status = -ENOMEM;
+			goto err_private;
 		}
 		cb_info->mref = mref;
 
@@ -295,12 +313,12 @@ void *log_reserve(struct log_status *logst, struct log_header *lh)
 #ifdef CONFIG_MARS_MEM_MAX_RESERVE
 		set_brick_mem_freelist_max(mref->ref_len, len2order(mref->ref_len));
 #endif
-		for (;;) {
+		for (attempt = 0; ; attempt++) {
 			status = GENERIC_INPUT_CALL(logst->input, mref_get, mref);
 			if (likely(status >= 0)) {
 				break;
 			}
-			if (status != -ENOMEM && status != -EAGAIN) {
+			if ((status != -ENOMEM && status != -EAGAIN) || attempt >= 2) {
 				MARS_ERR("mref_get() failed, status = %d\n", status);
 				goto err_free;
 			}
@@ -311,6 +329,7 @@ void *log_reserve(struct log_status *logst, struct log_header *lh)
 
 		if (unlikely(mref->ref_len < total_len)) {
 			MARS_ERR("ref_len = %d total_len = %d\n", mref->ref_len, total_len);
+			status = -EIO;
 			goto put;
 		}
 
@@ -333,7 +352,7 @@ void *log_reserve(struct log_status *logst, struct log_header *lh)
 	DATA_PUT(data, offset, lh->l_len);
 	logst->decompresslen_offset = offset;
 	DATA_PUT(data, offset, (short)0); /* placeholder */
-	DATA_PUT(data, offset, (int)0); // spare
+	DATA_PUT(data, offset, lh->l_flags);
 	DATA_PUT(data, offset, lh->l_code);
 	DATA_PUT(data, offset, (short)0); // spare
 
@@ -348,15 +367,19 @@ void *log_reserve(struct log_status *logst, struct log_header *lh)
 put:
 	GENERIC_INPUT_CALL_VOID(logst->input, mref_put, mref);
 	logst->log_mref = NULL;
-	return NULL;
+	goto err_private;
 
 err_free:
 	mars_free_mref(mref);
+err_private:
 	if (logst->private) {
-		// TODO: if callbacks are already registered, call them here with some error code
+		_do_callbacks(logst->private, status);
 		brick_mem_free(logst->private);
+		logst->private = NULL;
 	}
 err:
+	if (status != -ENOMEM && status != -EAGAIN)
+		cmpxchg(&logst->posix_error_code, 0, status);
 	return NULL;
 }
 EXPORT_SYMBOL_GPL(log_reserve);
@@ -891,7 +914,7 @@ int log_scan(void *buf,
 		DATA_GET(buf, offset, lh->l_pos);
 		DATA_GET(buf, offset, lh->l_len);
 		DATA_GET(buf, offset, lh->l_decompress_len);
-		offset += 4; // skip spare
+		DATA_GET(buf, offset, lh->l_flags);
 		DATA_GET(buf, offset, lh->l_code);
 		offset += 2; // skip spare
 

@@ -1,16 +1,32 @@
 MARS Long Distance Replication Software
+======================================
 
-See http://schoebel.github.io/mars/
+MARS provides asynchronous block storage replication through a Linux kernel
+module, transaction logs and the marsadm administration tool. This fork
+modernizes the out-of-tree module for unpatched Linux kernels, with x86-64
+as the tested target. Other architectures and 64 KiB page sizes are unvalidated.
 
-Very detailed documentation / motivation / use cases can be found there.
-Please look into the docu/ subdirectory.
+Start with INSTALL. Current support, replication/durability/discard semantics,
+network configuration, release checks and remaining work are documented in
+docu/modern-kernel.rst. The current guidance takes precedence over historic
+kernel pre-patch requirements and roadmap promises in the original manual.
 
-License: GPLv2+ (see file COPYING)
-Documentation is under FDL.
+Build the module with the configured headers and compiler of the target
+kernel. For Clang kernels:
 
-This is intended for the whole project, and is valid for all parts
-from the original author as well as parts from 1&1.
+    make -C kernel KDIR=/lib/modules/$(uname -r)/build LLVM=1 W=1
 
-Any further contributors to contrib/ subdirectory are strongly encouraged
-to put their files also under GPL or FDL, or at least a compatible
-license (see newest descriptions at fsf.org).
+Build-tool regressions:
+
+    python3 -m unittest discover -s test_suite/build -v
+
+Disposable functional tests and their prerequisites are in
+test_suite/qemu/README. CI configurations are in .github/workflows/.
+
+Original project: https://github.com/schoebel/mars
+Historical background: https://schoebel.github.io/mars/
+The docu/ directory contains the original detailed administration manual.
+
+License: GPLv2+ (see COPYING). Documentation is under the FDL.
+This applies to original-author and 1&1 contributions; retain individual
+third-party license notices. New contributions should use compatible terms.

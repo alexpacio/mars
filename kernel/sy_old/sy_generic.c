@@ -546,6 +546,11 @@ bool mars_is_mountpoint(const char *pathname)
 		MARS_WRN("path '%s' has invalid dentry\n", pathname);
 		goto done_put;
 	}
+#ifdef MARS_MODERN_KERNEL
+	/* kern_path() has already followed the mount to its root dentry. */
+	res = path.dentry == path.mnt->mnt_root;
+	goto done_put;
+#endif
 	if (unlikely(!follow_up(&path))) {
 		MARS_WRN("path '%s' has no vfsmnt\n", pathname);
 		goto done_put;

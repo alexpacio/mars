@@ -1,3 +1,19 @@
+mars (0.1astable114+modern1-1) UNRELEASED; urgency=medium
+
+  * Use the canonical external module build in DKMS packages.
+  * Validate configuration and generate reproducible version metadata.
+  * Add opt-in service integration, modern udev rules and installation docs.
+  * Port upstream administration cleanups; package JSON status and offline
+    replica comparison tools.
+  * Add logged DISCARD and WRITE_ZEROES, backing geometry propagation and
+    native deallocation with compatible zero-payload fallback.
+  * Make successful write completion durable; fix replay, error propagation,
+    allocation cleanup and asynchronous request lifetimes.
+  * Require explicit network configuration; add WireGuard interface policy,
+    export controls and validation of protocol frames and pulled metadata.
+
+ -- MARS contributors <noreply@example.invalid>  Wed, 14 Oct 2026 00:00:00 +0000
+
 mars (0.1astable114-1) unstable; urgency=medium
 
   * Initial release (Closes: #nnnn)  <nnnn is the bug number of your ITP>

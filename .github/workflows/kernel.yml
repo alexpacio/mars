@@ -1,0 +1,90 @@
+name: Kernel and package checks
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build-tools:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 -m unittest discover -s test_suite/build -v
+      - run: perl -c userspace/marsadm
+      - run: python3 -m unittest discover -s test_suite/unit -p 'test_*.py'
+      - name: Validate protocol path parsing with sanitizers
+        run: |
+          cc -Wall -Wextra -Werror -fsanitize=address,undefined test_suite/unit/network-paths.c -o /tmp/network-paths
+          /tmp/network-paths
+      - name: Build Debian source packages without changing source files
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y debhelper dh-sequence-dkms
+          dpkg-buildpackage -b -us -uc
+          git diff --exit-code
+      - uses: actions/upload-artifact@v4
+        with:
+          name: debian-packages
+          path: ../*.deb
+  kernel:
+    needs: build-tools
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        kernel: ['v6.18', 'v7.2']
+        compiler: [gcc, clang]
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang llvm lld libelf-dev libssl-dev flex bison bc kmod
+      - name: Fetch a fixed upstream kernel tag
+        run: git clone --depth=1 --branch '${{ matrix.kernel }}' https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git "$RUNNER_TEMP/linux"
+      - name: Configure and compile the target kernel
+        env:
+          COMPILER: ${{ matrix.compiler }}
+        run: |
+          test_suite/ci/configure-kernel.sh "$RUNNER_TEMP/linux" normal "$COMPILER"
+          if [ "$COMPILER" = clang ]; then
+            make -C "$RUNNER_TEMP/linux" -j2 LLVM=1 bzImage modules
+          else
+            make -C "$RUNNER_TEMP/linux" -j2 CC=gcc bzImage modules
+          fi
+      - uses: actions/download-artifact@v4
+        with:
+          name: debian-packages
+          path: ${{ runner.temp }}/packages
+      - name: Build the module shipped in the Debian package
+        env:
+          COMPILER: ${{ matrix.compiler }}
+        run: |
+          mkdir "$RUNNER_TEMP/package"
+          dpkg-deb -x "$RUNNER_TEMP"/packages/mars-dkms_*.deb "$RUNNER_TEMP/package"
+          set -- "$RUNNER_TEMP"/package/usr/src/mars-*
+          module_source=$1
+          if [ "$COMPILER" = clang ]; then
+            make -C "$module_source/kernel" "KDIR=$RUNNER_TEMP/linux" LLVM=1 W=1 -j2 > "$RUNNER_TEMP/package/build.log" 2>&1
+          else
+            make -C "$module_source/kernel" "KDIR=$RUNNER_TEMP/linux" CC=gcc W=1 -j2 > "$RUNNER_TEMP/package/build.log" 2>&1
+          fi
+      - name: Compile the default MARS configuration
+        run: test_suite/ci/build-module.sh "$RUNNER_TEMP/linux" "$RUNNER_TEMP/default" '${{ matrix.compiler }}'
+      - name: Compile MARS debugging and memory checks
+        env:
+          MARS_DEBUG: 'y'
+          MARS_DEBUG_MEM: 'y'
+        run: test_suite/ci/build-module.sh "$RUNNER_TEMP/linux" "$RUNNER_TEMP/debug" '${{ matrix.compiler }}'
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: kernel-${{ matrix.kernel }}-${{ matrix.compiler }}
+          path: |
+            ${{ runner.temp }}/default/build.log
+            ${{ runner.temp }}/default/modinfo.txt
+            ${{ runner.temp }}/debug/build.log
+            ${{ runner.temp }}/debug/modinfo.txt
+            ${{ runner.temp }}/linux/.config
+            ${{ runner.temp }}/package/build.log

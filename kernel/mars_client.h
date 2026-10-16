@@ -105,6 +105,7 @@ struct client_bundle {
 	int last_thread_nr;
 	short old_channel;
 	enum CL_BUNDLE_STATE bundle_state;
+	bool stopping;
 	wait_queue_head_t sender_event;
 	struct client_threadinfo sender;
 	struct client_channel channel[MAX_CLIENT_CHANNELS];

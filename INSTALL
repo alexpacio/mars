@@ -1,147 +1,137 @@
-Linux 7.2 and 7.3
-=================
-
-The default module configuration builds against Linux 7.2/7.3 without the
-historical kernel pre-patches. Use the matching, configured kernel headers
-and the compiler used to build that kernel. For example, for a Clang kernel:
-
-    make -C kernel KDIR=/lib/modules/7.2.9-2-cachyos/build LLVM=1 -j8
-
-For a GCC kernel, omit LLVM=1. The result is kernel/mars.ko. Build separately
-for each kernel release; clean before changing the target kernel:
-
-    make -C kernel KDIR=/lib/modules/7.2.9-2-cachyos/build clean
-    make -C kernel KDIR=/lib/modules/7.3.0-rc6-2-cachyos-rc/build LLVM=1 -j8
-
-Modern kernels use the SIO worker backend for regular files and transaction
-logs, with kernel_read/kernel_write and fsync. The old syscall-based kernel
-AIO backend is disabled on these kernels. Block-device backing storage still
-uses BIO. SIO may have different throughput and latency from the legacy AIO
-backend; performance has not been benchmarked by this compatibility port.
-
-The compatibility layer handles current VFS, socket, sysctl and block APIs,
-including the separate kernel-thread filesystem root introduced in 7.3.
-Use the default MARS configuration; the optional historic file logger
-(CONFIG_MARS_DEBUG_DEVEL_VIA_SAY) is not covered by this port's validation.
-Diagnostic messages are available through the kernel log.
-
-See test_suite/qemu/README for reproducible QEMU microvm tests using direct
-kernel boot. These tests build isolated module copies and use disposable
-virtual disks; they do not install or load MARS on the host.
-
-Legacy kernel installation
+Modern kernel installation
 ==========================
 
-The following pre-patch instructions apply to the older kernel support path.
+The modern compatibility path targets unpatched 64-bit Linux 6.18 and later. See docu/modern-kernel.rst
+for the support matrix, durability/discard behavior, secure network setup,
+release checks and remaining limitations. That document supersedes the
+legacy manual's pre-patch, SIO and VM recommendations for the modern path.
 
-You need the kernel sources for at least 2.6.32. Some elder versions
-may work, but we have not tested it.
+Install configured headers for the exact target kernel, make, Perl, and the
+compiler family used for that kernel. Module.symvers is required; merely
+running modules_prepare is insufficient when symbol versions are enabled.
+For a Clang kernel, for example:
 
-Currently, MARS Light builds only with 64bit kernels.
+    make -C kernel KDIR=/lib/modules/7.2.9-2-cachyos/build LLVM=1 W=1 -j8
 
-Go to your linux source tree, and apply one of the pre-patches for MARS.
-You can find them in the subdirectory pre-patches/ of the MARS sources.
+For a GCC kernel, omit LLVM=1. The result is kernel/mars.ko. Use a fresh staged
+source directory per target kernel (or clean before changing KDIR):
 
-These pre-patches are almost trivial, they contain only a few
-EXPORT_SYMBOL() statements. Porting to other kernel versions should
-be trivial.
+    python3 scripts/stage-source.py /tmp/mars-build --version local-review
+    make -C /tmp/mars-build/kernel KDIR=/lib/modules/$(uname -r)/build W=1
 
-One of the pre-patches has been ported to an openvz kernel
-even by one of our sysadmins, who usually does no C programming.
-So this should be no major hurdle.
+External builds validate kernel dependencies and MARS option values against
+kernel/Kconfig. Override options through the environment, for example:
 
-Because of the need for some small pre-patches, we recommend to build
-MARS inside the kernel source tree (in-tree).
+    MARS_DEBUG=y MARS_DEBUG_MEM=y make -C kernel KDIR=... LLVM=1 W=1
 
-If you are an experience sysadmin and want to build MARS as an external
-kernel module, you may try the Debian based scripts provided by our
-sysadmins. Be warned that you have to check yourself for source
-compatibility, the right compiler flags, etc; very nasty errors may
-appear if you fail to do so!
+The configuration header is regenerated when overrides change. Explicit
+options whose dependencies are disabled fail the build. An external build
+cannot enable missing kernel facilities: enable them in the target kernel.
+MARS_DEBUG_DEVEL_VIA_SAY is a historic file logger; ordinary diagnostics use
+the kernel log. Optional legacy paths require their own runtime validation.
 
-Therefore, try the in-tree method first.
+Module installation and signing
+-------------------------------
 
-For the in-tree build, you need to also apply one of the patches
-pre-patches/vanilla-*/*necessary-for-in-tree-build.patch
-or similar.
+Build Debian packages with dpkg-buildpackage -b -us -uc; see debian/README.md.
+For a local DKMS installation, choose a unique version and stage the sources:
 
-Go to ${your_kernel_source}/block/ and clone the MARS git repository there.
+    python3 scripts/stage-source.py /tmp/mars-dkms-source --version 0.1-local1
+    sudo cp -a /tmp/mars-dkms-source /usr/src/mars-0.1-local1
+    sudo dkms add -m mars -v 0.1-local1
+    sudo dkms build -m mars -v 0.1-local1 -k "$(uname -r)"
+    sudo dkms install -m mars -v 0.1-local1 -k "$(uname -r)"
 
-Then build your kernel as usual. You need to use 64bit. In addition, you
-need to enable the following options before MARS shows up at all:
+DKMS uses the target kernel's compiler family; LLVM kernels also require
+clang, llvm and lld. Configure DKMS's mok_signing_key and mok_certificate in
+/etc/dkms/framework.conf according to your distribution's DKMS package.
+Enroll the corresponding public certificate using the distribution's Secure
+Boot enrollment procedure, then rebuild/reinstall. Never package private
+signing keys. Check the installed artifact before loading:
 
-PROC_SYSCTL
-HIGH_RES_TIMERS
+    modinfo -F vermagic mars
+    modinfo -F signer mars
+    mokutil --sb-state
 
-Don't enable CONFIG_DEBUG_SG (this will currently not work until it is fixed).
+A nonempty signer only establishes that a signature exists; the booted
+kernel must trust that certificate. Validate load, rebuild after a kernel
+update, and removal in a disposable VM with signature enforcement enabled.
+Manual signing, when needed, uses the target kernel's scripts/sign-file:
 
-In Kconfig, you will find lots of additional options for MARS. Most
-of them should be left at their default. It suffices just to switch
-on MARS as a whole, and let it build as a single kernel module.
+    /path/to/kernel/scripts/sign-file sha256 private-key.pem certificate.der kernel/mars.ko
 
-If no Kconfig options for MARS show up in the in-tree build, you have
-probably forgotten to apply the appropriate
-pre-patches/vanilla-*/*necessary-for-in-tree-build.patch
-or similar.
+Signing references: https://github.com/dkms-project/dkms#module-signing and
+https://docs.kernel.org/admin-guide/module-signing.html.
 
-Finally, copy userspace/marsadm to some appropriate location in
-your $PATH.
+Sign before compressing/installing the module. Reproducible unsigned build
+metadata does not make independently signed module bytes identical.
 
-Do the following at both your primary and secondary node:
+Cluster setup
+-------------
 
-After booting your pre-patched kernel, don't modprobe mars. Before
-that, create an empty filesystem with at least 100GB (ext4 is highly
-recommended; there seem to remain some recursion deadlock problems
-with xfs which will be hopefully fixed in the next time)
-and mount it to /mars/ .
+Use dedicated backing devices of equal size and a separate ext4 filesystem
+mounted at /mars with enough room for transaction logs and outages. The
+default configured emergency thresholds total 20 GiB; plan capacity above
+that minimum. Backing devices must not be mounted directly while MARS owns
+them. Never place /mars on a MARS resource.
 
-Additionally, you need an empty block device having exactly the same
-size at both nodes. In the following, they are called /dev/vg-x/myspace .
+Install userspace/marsadm as /usr/sbin/marsadm. Configure WireGuard and the
+module's network policy before creating or joining the cluster, as described
+in docu/modern-kernel.rst. Node names must resolve to
+cluster addresses consistently. The following commands create metadata and
+write to the specified backing storage; use new, dedicated devices.
 
 On the primary:
-	marsadm create-cluster
 
-On the secondary:
-	marsadm join-cluster ${hostname_of_primary}
+    marsadm create-cluster
+    modprobe mars
 
-Only after that, do on both nodes:
-	modprobe mars
+On each secondary, with /mars mounted and the secure network ready:
+
+    marsadm join-cluster PRIMARY_HOSTNAME
+
+Native cluster join loads the module if necessary and contacts the primary.
+The historic SSH/rsync fallback has been removed. Module options from
+/etc/modprobe.d/mars.conf must therefore be ready before join-cluster runs.
 
 On the primary:
-	marsadm create-resource myspace /dev/vg-x/myspace
 
-Wait a few seconds until the state information about the new resource has
-spread over the whole cluster.
+    marsadm create-resource myspace /dev/vg-x/myspace
 
-On the secondary:
-	marsadm join-resource myspace /dev/vg-x/myspace
+On each secondary:
 
-Shortly after that, the initial full sync should start automatically.
-On the primary, a device /dev/mars/myspace should appear, having exactly
-the same size as /dev/vg-x/myspace .
+    marsadm join-resource myspace /dev/vg-x/myspace
 
-Now you can use /dev/mars/myspace on the primary for creating a filesystem,
-mounting, or exporting via iSCSI, etc.
+Wait for initial synchronization before relying on the secondary. Application
+I/O goes through /dev/mars/myspace on the primary. Monitor transaction log
+capacity, replica lag, kernel errors and emergency mode. Use mars-status --json for
+the versioned monitoring schema. marsadm cron and
+marsadm log-delete-all all maintain logs; the Debian tools package includes
+cron entries. Do not delete logfiles outside the documented recovery tools.
 
-From time to time, you should execute the following commands on one of
-your nodes:
-	marsadm log-rotate all
-	sleep 10
-	marsadm log-delete-all all
-... in order to prevent your /mars/ filesystem from running full.
+The packaged mars.service is disabled by default. After configuring storage,
+networking, cluster metadata and application shutdown ordering, enable it
+explicitly. It requires /mars to be a mountpoint and /mars/uuid to exist as
+a symlink, loads MARS on start, and runs marsadm down all before unloading.
+Services mounting/exporting resources must specify After=mars.service and
+Requires=mars.service so they stop first. The service never creates a cluster
+or automatically promotes resources. Failed demotion must be investigated;
+do not force module removal or unplug backing storage.
 
-hint: use cron jobs for automation.
+Validation
+----------
 
-Most marsadm commands are very similar to drbdadm. Details can be
-found in docu/mars-user-manual.pdf. The sourcecode of marsadm is a very
-simple and stupid perl script, which intentionally does not use any
-perl module and no OO. The source code will tell you almost anything
-about the symlinks present in /mars/.
+Run python3 -m unittest discover -s test_suite/build -v for build-tool checks.
+See test_suite/qemu/README for disposable VM tests. Module loads and storage
+tests belong in disposable guests, including DKMS/signing checks; the build
+scripts do not load a module or modify host block devices.
 
-If you are curious about how MARS replicates its state information
-over the network, just do the following on both nodes:
-	watch ls -l /mars/resource-myspace/
+Legacy kernels
+--------------
 
-Alternatively / additionally, you may try Joerg's script mars-status.pl
-which will deliver colorful state reports from the practical viewpoint
-of an experienced sysadmin.
+Historic kernel support, pre-patches and the original administration manual
+remain in pre-patches/ and docu/. They are not a current compatibility
+promise. The old syscall-based kernel AIO backend is disabled on modern
+kernels; regular files and transaction logs use SIO with kernel_read,
+kernel_write and fsync, and backing block devices use BIO. Measure workload
+latency/throughput before adopting an untested deployment configuration.

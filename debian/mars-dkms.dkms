@@ -1,5 +1,1 @@
-PACKAGE_NAME="mars"
-PACKAGE_VERSION="0.1astable144"
-BUILT_MODULE_NAME[0]="$PACKAGE_NAME"
-DEST_MODULE_LOCATION[0]="/kernel/drivers/block"
-AUTOINSTALL="yes"
+../contrib/mars-dkms.dkms

@@ -5,7 +5,7 @@
 config MARS
 	tristate "block storage replication MARS"
 	depends on m
-	depends on BLOCK && SYSCTL && PROC_FS && HIGH_RES_TIMERS
+	depends on 64BIT && BLOCK && SYSCTL && PROC_FS && HIGH_RES_TIMERS
 	default n
 	select LZO_COMPRESS
 	select LZO_DECOMPRESS
@@ -107,6 +107,7 @@ config MARS_DEBUG_ORDER0
 
 config MARS_DEFAULT_PORT
 	int "port number where MARS is listening"
+	range 1 65533
 	depends on MARS
 	default 7777
 	help
@@ -443,5 +444,5 @@ config MARS_PREFER_SIO
 	depends on MARS
 	default n
 	help
-	Normally OFF for production systems.
-	Only use as alternative for testing.
+	Modern unpatched kernels always use SIO for regular files and
+	transaction logs. This option only changes legacy kernel selection.

@@ -37,8 +37,16 @@ marsadm create-cluster
 ln -sfn qemu-replication-test /mars/uuid
 ln -sfn 10.42.0.1 /mars/ips/ip-primary
 ln -sfn 10.42.0.2 /mars/ips/ip-secondary
-modprobe mars
+case "$(cat /proc/cmdline)" in
+    *mars_test_legacy=1*) modprobe mars;;
+    *) modprobe mars mars_listen_addr=0.0.0.0 mars_allow_insecure=1;;
+esac
 perl -e 'print pack("N*", 0..262143)' >/tmp/pattern
+# Expected final image after discard, overlapping rewrite and write-zeroes.
+cp /tmp/pattern /tmp/expected
+dd if=/dev/zero of=/tmp/expected bs=4096 seek=64 count=64 conv=notrunc status=none
+dd if=/tmp/pattern of=/tmp/expected bs=4096 skip=80 seek=80 count=2 conv=notrunc status=none
+dd if=/dev/zero of=/tmp/expected bs=4096 seek=192 count=8 conv=notrunc status=none
 if [ "$node" = primary ]; then
     marsadm create-resource test /dev/vdb
     for i in {1..60}; do [ -b /dev/mars/test ] && break; sleep 1; done
@@ -53,6 +61,11 @@ if [ "$node" = primary ]; then
     dd if=/tmp/pattern of=/dev/mars/test bs=4096 conv=fsync status=none
     dd if=/dev/mars/test of=/tmp/readback bs=4096 count=256 iflag=direct status=none
     cmp /tmp/pattern /tmp/readback
+    blkdiscard -o 262144 -l 262144 /dev/mars/test
+    dd if=/tmp/pattern of=/dev/mars/test bs=4096 skip=80 seek=80 count=2 conv=fsync,notrunc status=none
+    blkdiscard -z -o 786432 -l 32768 /dev/mars/test
+    dd if=/dev/mars/test of=/tmp/readback bs=4096 count=256 iflag=direct status=none
+    cmp /tmp/expected /tmp/readback
     timeout 60 marsadm log-rotate test
     echo MARS_QEMU_PRIMARY_WRITTEN
     # The host stops this VM only once the secondary has verified the data.
@@ -66,7 +79,7 @@ else
     timeout 90 marsadm join-resource test /dev/vdb
     for i in {1..120}; do
         dd if=/dev/vdb of=/tmp/readback bs=4096 count=256 iflag=direct status=none
-        if cmp -s /tmp/pattern /tmp/readback; then
+        if cmp -s /tmp/expected /tmp/readback; then
             echo MARS_QEMU_REPLICATION_PASS
             poweroff
         fi

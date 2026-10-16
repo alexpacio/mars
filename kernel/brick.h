@@ -770,13 +770,10 @@ typedef enum brick_switch {
 				break;					\
 			brick_yield();					\
 			_err = PTR_ERR(_thr);				\
-			if (_err == -EAGAIN ||				\
-			    _err == -ENOMEM ||				\
-			    _err == -EINTR ||				\
+			if ((_err == -EAGAIN ||				\
+			     _err == -ENOMEM || _err == -EINTR) &&		\
 			    _max_retry-- > 0) {				\
-				brick_msleep(_nr_retry++);		\
-				if (_nr_retry > 1000)			\
-					_nr_retry = 1000;		\
+				brick_msleep(10 * ++_nr_retry);		\
 				continue;				\
 			}						\
 			BRICK_ERR("cannot create thread '%s', status = %d\n", _fmt, _err); \

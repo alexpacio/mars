@@ -1,0 +1,80 @@
+#!/usr/bin/perl
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Read-only, versioned status interface. Values are independently sampled.
+use strict;
+use warnings;
+use Getopt::Long qw(GetOptions);
+use JSON::PP;
+use Sys::Hostname qw(hostname);
+
+my $root = '/mars';
+my $peer = hostname();
+my ($json, $help);
+GetOptions('json' => \$json, 'root=s' => \$root, 'host=s' => \$peer,
+           'help' => \$help) or die "use mars-status --help\n";
+if ($help) {
+    print "usage: mars-status [--json] [--root DIRECTORY] [--host NODE] [RESOURCE]\n";
+    exit 0;
+}
+die "at most one resource may be selected\n" if @ARGV > 1;
+sub valid_name { return $_[0] =~ /^[A-Za-z0-9_][A-Za-z0-9_.+-]*$/; }
+die "invalid host name\n" unless valid_name($peer);
+my $selected = shift @ARGV;
+die "invalid resource name\n" if defined $selected && !valid_name($selected);
+die "metadata root must be a directory, not a symlink\n" unless -d $root && !-l $root;
+
+# Only these public kernel status links belong to schema version 1.
+my @fields = (
+    ['is_primary',          'is-primary',          0, 1],
+    ['if_state',            'if-state',            -2147483648, 2147483647],
+    ['if_flying',           'if-flying',           0, 2147483647],
+    ['open_count',          'open-count',          0, 2147483647],
+    ['log_fatal_error',     'log-fatal-error',     -2147483648, 0],
+    ['logical_block_size',  'logical-block-size',  512, 1073741824],
+    ['physical_block_size', 'physical-block-size', 512, 1073741824],
+    ['discard_supported',   'discard-supported',   0, 1],
+);
+sub number_link {
+    my ($path, $low, $high) = @_;
+    my $value = readlink($path);
+    return undef unless defined $value && $value =~ /^-?(?:0|[1-9][0-9]*)$/;
+    return undef if length($value) > 11;
+    return undef if $value < $low || $value > $high;
+    return 0 + $value;
+}
+my @names;
+if (defined $selected) {
+    @names = ($selected);
+} else {
+    opendir(my $dir, $root) or die "read $root: $!\n";
+    @names = sort map { substr($_, length('resource-')) }
+        grep { /^resource-(.+)$/ && valid_name($1) } readdir($dir);
+    closedir $dir;
+}
+my @resources;
+for my $name (@names) {
+    my $resource = "$root/resource-$name";
+    if (!-d $resource || -l $resource) {
+        die "resource $name is not a local metadata directory\n" if defined $selected;
+        next;
+    }
+    my $actual = "$resource/actual-$peer";
+    my %status = (resource => $name);
+    for my $field (@fields) {
+        my ($key, $link, $low, $high) = @$field;
+        $status{$key} = -d $actual && !-l $actual
+            ? number_link("$actual/$link", $low, $high) : undef;
+    }
+    push @resources, \%status;
+}
+if ($json) {
+    print JSON::PP->new->canonical->encode({schema_version => 1,
+                                           peer => $peer, resources => \@resources}), "\n";
+} else {
+    print join("\t", 'resource', map { $_->[0] } @fields), "\n";
+    for my $status (@resources) {
+        print join("\t", $status->{resource}, map {
+            defined $status->{$_->[0]} ? $status->{$_->[0]} : '?'
+        } @fields), "\n";
+    }
+}

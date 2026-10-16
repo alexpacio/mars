@@ -31,6 +31,8 @@
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/string.h>
+#include <linux/namei.h>
+#include <linux/moduleparam.h>
 
 #include "brick_wait.h"
 
@@ -43,6 +45,154 @@
 ///////////////////////// own type definitions ////////////////////////
 
 #include "mars_server.h"
+#include "mars_net_validation.h"
+
+/* Data I/O exports are local administrator policy, never peer metadata. */
+static char *mars_exports = "*";
+module_param(mars_exports, charp, 0400);
+MODULE_PARM_DESC(mars_exports, "Comma-separated resource names exported for network I/O (default *, empty disables)");
+
+static bool server_resource_allowed(const char *path)
+{
+	const char *resource, *end, *entry;
+	size_t len;
+
+	if (strncmp(path, "/mars/resource-", 15))
+		return false;
+	resource = path + 15;
+	end = strchr(resource, '/');
+	if (!end || end == resource)
+		return false;
+	len = end - resource;
+	if (!strcmp(mars_exports, "*"))
+		return true;
+	for (entry = mars_exports; *entry;) {
+		const char *comma = strchr(entry, ',');
+		size_t entry_len = comma ? comma - entry : strlen(entry);
+
+		if (entry_len == len && !strncmp(resource, entry, len))
+			return true;
+		if (!comma)
+			break;
+		entry = comma + 1;
+	}
+	return false;
+}
+
+static int server_parent_safe(const char *name)
+{
+#ifdef MARS_MODERN_KERNEL
+	struct path parent;
+	char *copy = brick_strdup(name);
+	char *slash;
+	int status;
+
+	if (!copy)
+		return -ENOMEM;
+	slash = strrchr(copy, '/');
+	*slash = '\0';
+	status = mars_kern_path(copy, LOOKUP_DIRECTORY | LOOKUP_NO_SYMLINKS, &parent);
+	if (!status)
+		path_put(&parent);
+	brick_string_free(copy);
+	return status;
+#else
+	/* Do not expose legacy VFS implementations with weaker confinement. */
+	return -EOPNOTSUPP;
+#endif
+}
+
+static int server_connect_allowed(const char *name)
+{
+	const char *leaf;
+	struct kstat stat;
+	int status;
+
+	if (!mars_net_path_valid(name, false) || !server_resource_allowed(name))
+		return -EACCES;
+	leaf = strchr(name + 15, '/');
+	if (!leaf || strchr(++leaf, '/'))
+		return -EACCES;
+	status = server_parent_safe(name);
+	if (status)
+		return status;
+	/* Only the locally configured data export may follow a device link.
+	 * Remote nodes' data links are membership metadata, never local exports.
+	 */
+	if (!strncmp(leaf, "data-", 5) && !strcmp(leaf + 5, my_id()))
+		return 0;
+	if (strncmp(leaf, "log-", 4) || leaf[4] < '0' || leaf[4] > '9')
+		return -EACCES;
+	status = mars_stat(name, &stat, true);
+	if (status == -ENOENT)
+		return 0; /* Replication can create a new transaction log. */
+	if (status)
+		return status;
+	return S_ISREG(stat.mode) ? 0 : -EACCES;
+}
+
+static bool server_path_list_allowed(const char *paths)
+{
+	char *copy, *cursor, *part;
+	bool valid = true;
+
+	if (!paths)
+		paths = "/mars";
+	if (strncmp(paths, "/mars", 5) || (paths[5] && paths[5] != '|'))
+		return false;
+	copy = brick_strdup(paths);
+	if (!copy)
+		return false;
+	cursor = copy;
+	while ((part = strsep(&cursor, "|"))) {
+		if (!mars_net_path_valid(part, true) ||
+		    (strcmp(part, "/mars") && strncmp(part, "/mars/", 6))) {
+			valid = false;
+			break;
+		}
+#ifdef MARS_MODERN_KERNEL
+		{
+			struct path dir;
+			int status = mars_kern_path(part, LOOKUP_DIRECTORY | LOOKUP_NO_SYMLINKS, &dir);
+
+			if (!status)
+				path_put(&dir);
+			else if (status != -ENOENT) {
+				valid = false;
+				break;
+			}
+		}
+#else
+		valid = false;
+		break;
+#endif
+	}
+	brick_string_free(copy);
+	return valid;
+}
+
+static int server_push_allowed(const char *target, const char *name)
+{
+	struct kstat stat;
+	int status;
+
+	if (!mars_net_link_mutable(name, my_id()) || !mars_net_link_target_valid(target))
+		return -EACCES;
+	/* Peer membership links may name another node's backing device, as
+	 * required by join-resource. They may never retarget our own device.
+	 */
+	/* Directories, data files and their ancestors cannot become links. */
+	status = mars_stat(name, &stat, true);
+	if (!status && !S_ISLNK(stat.mode))
+		return -EACCES;
+	if (status < 0 && status != -ENOENT)
+		return status;
+	status = server_parent_safe(name);
+	/* ordered_symlink may create missing directories; every VFS mutation
+	 * independently enforces LOOKUP_NO_SYMLINKS, including after a race.
+	 */
+	return status == -ENOENT ? 0 : status;
+}
 
 struct server_cookie {
 	struct mars_socket *server_socket;
@@ -71,6 +221,7 @@ static struct server_cookie server_cookie[MARS_TRAFFIC_MAX] = {
 };
 
 static struct task_struct *server_thread[MARS_TRAFFIC_MAX] = {};
+static bool server_registered;
 
 atomic_t server_handler_count = ATOMIC_INIT(0);
 EXPORT_SYMBOL_GPL(server_handler_count);
@@ -122,6 +273,7 @@ int cb_thread(void *data)
 		goto done;
 
 	WRITE_ONCE(brick->cb_running, true);
+	complete_all(&brick->cb_start);
 	brick_wake_smp(&brick->startup_event);
 
         while (!brick_thread_should_stop() ||
@@ -219,6 +371,7 @@ done:
 	MARS_DBG("---------- cb_thread terminating, status = %d\n", status);
 	brick_wake_smp(&brick->startup_event);
 	WRITE_ONCE(brick->cb_running, false);
+	complete_all(&brick->cb_start);
 	return status;
 }
 
@@ -288,6 +441,9 @@ int server_io(struct server_brick *brick, struct mars_socket *sock, struct mars_
 		mars_free_mref(mref);
 		goto done;
 	}
+	/* A remote caller cannot weaken persistence of an acknowledged write. */
+	if (mref->ref_flags & MREF_WRITE)
+		mref->ref_flags &= ~MREF_SKIP_SYNC;
 
 	if (!mref_a->first_data) {
 		mref_a->first_data = mref->ref_data;
@@ -352,7 +508,7 @@ int _set_server_sio_params(struct mars_brick *_brick, void *private)
 		return -EINVAL;
 	}
 	sio_brick->o_direct = false;
-	sio_brick->o_fdsync = false;
+	sio_brick->o_fdsync = true;
 	MARS_INF("name = '%s' path = '%s'\n", _brick->brick_name, _brick->brick_path);
 	return 1;
 }
@@ -421,45 +577,27 @@ void _stop_bio(struct server_brick *brick, struct mars_brick *bio_brick)
 	}
 }
 
-static
-bool server_check_switch(struct server_brick *brick, const char *path)
+static bool server_check_switch(struct server_brick *brick, const char *path)
 {
-	char base[128];
-	int i = 0;
-	int parts = 3;
-	bool res = false;
+	const char *end;
+	bool attached;
 
-	if (brick->need_detach) {
-		goto done;
+	if (brick->need_detach)
+		return false;
+	if (!brick->switch_path) {
+		if (strncmp(path, "/mars/resource-", 15))
+			return false;
+		end = strchr(path + 15, '/');
+		if (!end)
+			return false;
+		brick->switch_path = path_make("%.*s/todo-%s/attach",
+					     (int)(end - path), path, my_id());
+		if (!brick->switch_path)
+			return false;
 	}
-	if (brick->switch_path) {
-		goto check;
-	}
-	for (;;) {
-		char c = path[i];
-
-		base[i] = c;
-		if (!c) {
-			goto done;
-		}
-		i++;
-		if (i >= sizeof(base) - 32) {
-			goto done;
-		}
-		if (c == '/' &&
-		    --parts <= 0) {
-			break;
-		}
-	}
-	sprintf(base + i,
-		"todo-%s/attach",
-		my_id());
-	brick->switch_path = brick_strdup(base);
- check:
-	res = _check_switch(brick->switch_path) != 0;
-	brick->need_detach = !res;
- done:
-	return res;
+	attached = _check_switch(brick->switch_path) != 0;
+	brick->need_detach = !attached;
+	return attached;
 }
 
 static
@@ -481,10 +619,14 @@ int handler_thread(void *data)
 	int status = -EINVAL;
 
 	MARS_DBG("#%d --------------- handler_thread starting on socket %px\n", sock->s_debug_nr, sock);
-	if (!ok)
+	if (!ok || !handler_global)
 		goto done;
 
 	cb_name = brick_strdup(brick->brick_path);
+	if (!cb_name) {
+		status = -ENOMEM;
+		goto done;
+	}
 	/* naming convention: mars_c instead of mars_h */
 	cb_name[5] = 'c';
 	thread = brick_thread_create(cb_thread,
@@ -500,12 +642,15 @@ int handler_thread(void *data)
 	brick->cb_thread = thread;
 
 	/* wait until the callback thread has really started */
-	while (!READ_ONCE(brick->cb_running)) {
-		msleep(100);
+	wait_for_completion(&brick->cb_start);
+	if (!READ_ONCE(brick->cb_running)) {
+		status = -ECONNABORTED;
+		goto done;
 	}
 
 	WRITE_ONCE(brick->handler_running, true);
 	WRITE_ONCE(brick->handler_started, true);
+	complete_all(&brick->handler_start);
 	brick_wake_smp(&brick->startup_event);
 
         while (!list_empty(&handler_global->brick_anchor) ||
@@ -597,6 +742,10 @@ int handler_thread(void *data)
 			const char *path = cmd.cmd_str1 ? cmd.cmd_str1 : "/mars";
 			int max_retry = dent_retry;
 
+			if (!server_path_list_allowed(path)) {
+				status = -EACCES;
+				break;
+			}
 			while (atomic_read(&running_dent) >= dent_limit) {
 				if (max_retry-- <= 0) {
 					MARS_DBG("#%d dent limit reached\n", sock->s_debug_nr);
@@ -610,7 +759,6 @@ int handler_thread(void *data)
 				}
 				brick->shutdown_jiffies = jiffies;
 			}
-			atomic_inc(&running_dent);
 
 			/* New protocol.
 			 * We cannot send/recv intermediate cmds at the
@@ -635,6 +783,7 @@ int handler_thread(void *data)
 
 			mars_free_dent_all(handler_global);
 
+			atomic_inc(&running_dent);
 			status = mars_get_dent_list(
 				handler_global,
 				path,
@@ -670,6 +819,9 @@ int handler_thread(void *data)
 			status = -EINVAL;
 			CHECK_PTR(path, err);
 			CHECK_PTR_NULL(_bio_brick_type, err);
+			status = server_connect_allowed(path);
+			if (status < 0)
+				goto err;
 
 			/* prevent any double connects */
 			if (brick->conn_brick) {
@@ -765,25 +917,9 @@ int handler_thread(void *data)
 			break;
 		case CMD_PUSH_LINK:
 		{
-			/* TODO: better security
-			 */
-			status = 0;
-			if (unlikely(!cmd.cmd_str1 || !cmd.cmd_str2))
+			status = server_push_allowed(cmd.cmd_str1, cmd.cmd_str2);
+			if (status < 0)
 				break;
-			/* Confine to /mars/ and /dev/ */
-			if (unlikely(strncmp(cmd.cmd_str2, "/mars/", 6) ||
-				     (cmd.cmd_str1[0] == '/' &&
-				      strncmp(cmd.cmd_str1, "/mars/", 6) &&
-				      strncmp(cmd.cmd_str1, "/dev/", 5)))) {
-				MARS_ERR("Invalid push attempt '%s' -> '%s'\n",
-					 cmd.cmd_str2,
-					 cmd.cmd_str1);
-				printk(KERN_ALERT "Invalid MARS push attempt '%s' -> '%s'\n",
-					 cmd.cmd_str2,
-					 cmd.cmd_str1);
-				status = -EPERM;
-				break;
-			}
 			invalidate_user_cache();
 
 			status =
@@ -805,6 +941,15 @@ int handler_thread(void *data)
 		{
 			struct kstat probe;
 
+			if (!mars_net_name_valid(cmd.cmd_str1) ||
+			    !mars_net_path_valid(cmd.cmd_str2, false) ||
+			    strncmp(cmd.cmd_str2, "/mars/", 6)) {
+				status = -EACCES;
+				break;
+			}
+			status = server_parent_safe(cmd.cmd_str2);
+			if (status && status != -ENOENT)
+				break;
 			status = mars_stat(cmd.cmd_str2, &probe, true);
 			if (status < 0) {
 				invalidate_user_cache();
@@ -855,10 +1000,10 @@ int handler_thread(void *data)
 		}
 	}
 
-	server_shutdown_socket(sock);
-	mars_put_socket(sock);
-
  done:
+	server_shutdown_socket(sock);
+	if (ok)
+		mars_put_socket(sock);
 	MARS_DBG("#%d handler_thread terminating, status = %d\n", sock->s_debug_nr, status);
 
 	smp_mb();
@@ -867,7 +1012,8 @@ int handler_thread(void *data)
 	}
 
 	smp_mb();
-	mars_kill_brick_all(handler_global, &handler_global->brick_anchor, false);
+	if (handler_global)
+		mars_kill_brick_all(handler_global, &handler_global->brick_anchor, false);
 
 	thread = brick->cb_thread;
 	if (thread) {
@@ -877,15 +1023,19 @@ int handler_thread(void *data)
 	}
 
 	smp_mb();
-	mars_free_dent_all(handler_global);
+	if (handler_global)
+		mars_free_dent_all(handler_global);
 
 	debug_nr = sock->s_debug_nr;
 	
 	MARS_DBG("#%d done.\n", debug_nr);
 	atomic_dec(&server_handler_count);
 	brick->killme = true;
-	free_mars_global(handler_global);
+	if (handler_global)
+		free_mars_global(handler_global);
 	WRITE_ONCE(brick->handler_running, false);
+	WRITE_ONCE(brick->handler_started, true);
+	complete_all(&brick->handler_start);
 	return status;
 }
 
@@ -1101,6 +1251,8 @@ static int server_brick_construct(struct server_brick *brick)
 {
 	INIT_LIST_HEAD(&brick->server_head);
 	init_waitqueue_head(&brick->startup_event);
+	init_completion(&brick->handler_start);
+	init_completion(&brick->cb_start);
 	init_waitqueue_head(&brick->cb_event);
 	sema_init(&brick->socket_sem, 1);
 	mutex_init(&brick->cb_mutex);
@@ -1237,6 +1389,8 @@ static int port_thread(void *data)
 	int status = 0;
 
 	INIT_LIST_HEAD(&port_anchor);
+	if (!server_global)
+		return -ENOMEM;
 
 	MARS_INF("-------- port %d thread starting on host '%s' ----------\n",
 		 cookie->port_nr, id);
@@ -1336,7 +1490,8 @@ static int port_thread(void *data)
 		brick->port_nr = cookie->port_nr;
 		memcpy(&brick->handler_socket, &handler_socket, sizeof(struct mars_socket));
 
-		/* TODO: check authorization.
+		/* The listener is bound to the configured authenticated transport;
+		 * each command additionally enforces its path/export policy.
 		 */
 
 		brick->power.button = true;
@@ -1347,9 +1502,7 @@ static int port_thread(void *data)
 			goto err;
 		}
 		/* wait until the new handler_thread is really running */
-		while (!READ_ONCE(brick->handler_started)) {
-			brick_msleep(100);
-		}
+		wait_for_completion(&brick->handler_start);
 
 		if (mars_socket_is_alive(&brick->handler_socket)) {
 			list_del_init(&brick->server_head);
@@ -1384,8 +1537,6 @@ static int port_thread(void *data)
 
 	check_bricks(&port_anchor, true);
 
-	server_thread[cookie->port_nr] = NULL;
-	brick_msleep(200);
 
 	mars_kill_brick_all(server_global, &server_global->brick_anchor, false);
 
@@ -1405,8 +1556,6 @@ void exit_mars_server(void)
 	int i;
 
 	MARS_INF("exit_server()\n");
-	server_unregister_brick_type();
-
 	for (i = 0; i < MARS_TRAFFIC_MAX; i++) {
 		struct mars_socket *server_socket = server_cookie[i].server_socket;
 
@@ -1414,29 +1563,45 @@ void exit_mars_server(void)
 	}
 
 	for (i = 0; i < MARS_TRAFFIC_MAX; i++) {
-		if (server_thread[i]) {
+		if (server_thread[i] && !IS_ERR(server_thread[i])) {
 			MARS_INF("stopping server thread %d...\n", i);
 			brick_thread_stop(server_thread[i]);
 		}
+		server_thread[i] = NULL;
 		MARS_INF("closing server socket %d...\n", i);
-		mars_put_socket(server_cookie[i].server_socket);
+		if (atomic_read(&server_cookie[i].server_socket->s_count) > 0)
+			mars_put_socket(server_cookie[i].server_socket);
+	}
+	if (server_registered) {
+		server_unregister_brick_type();
+		server_registered = false;
 	}
 }
 
 int __init init_mars_server(void)
 {
 	int i;
+	int result;
 
 	MARS_INF("init_server()\n");
+	result = server_register_brick_type();
+	if (result < 0)
+		return result;
+	server_registered = true;
+	if (!mars_net_enabled())
+		return 0;
 
 	for (i = 0; i < MARS_TRAFFIC_MAX; i++) {
 		struct sockaddr_storage sockaddr = {};
-		char tmp[16];
+		char tmp[128];
 		int port_nr = mars_net_default_port + i;
 		int status;
 
-		server_cookie[i].port_nr = port_nr;
-		sprintf(tmp, ":%d", port_nr);
+		server_cookie[i].port_nr = i;
+		if (strchr(mars_listen_addr, ':'))
+			snprintf(tmp, sizeof(tmp), "[%s]:%d", mars_listen_addr, port_nr);
+		else
+			snprintf(tmp, sizeof(tmp), "%s:%d", mars_listen_addr, port_nr);
 		status = mars_create_sockaddr(&sockaddr, tmp);
 		if (unlikely(status < 0)) {
 			exit_mars_server();
@@ -1465,5 +1630,5 @@ int __init init_mars_server(void)
 		}
 	}
 
-	return server_register_brick_type();
+	return 0;
 }

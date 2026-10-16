@@ -12,6 +12,15 @@ marsadm \- Administration tool for MARS.\" marsadm
 .B marsadm {\fIglobal_option\fR} view[\-\fImacroname\fR] [\fIresource_name\fR | all]
 .br
 
+.SH CURRENT FORK
+For current installation, network policy and supported kernels, see
+/usr/share/doc/mars-tools/modern-kernel.rst.gz and INSTALL.gz.
+The historical SSH/rsync fallback and systemd template generator have been
+removed. Related options below are obsolete; use marsadm help for the
+current command reference. Native join-cluster loads the module if needed,
+so configure its WireGuard policy first. The opt-in mars.service replaces
+the template generator. For monitoring use mars-status --json.
+
 .SH DESCRIPTION
 MARS is a kernel\-level asynchronous replication system for block devices.
 It is tailored for long\-distance replication and through network

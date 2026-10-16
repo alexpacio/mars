@@ -35,6 +35,7 @@
 #include "brick_wait.h"
 #include "mars.h"
 #include "lib_limiter.h"
+#include "mars_trace.h"
 
 #ifndef READ
 #define READ  0
@@ -201,7 +202,7 @@ void copy_endio(struct generic_callback *cb)
 	struct mref_object *mref;
 	struct copy_input *input;
 	struct copy_brick *brick;
-	struct copy_state *st;
+	struct copy_state *st = NULL;
 	struct mref_object *old_mref;
 	unsigned index;
 #ifdef CONFIG_MARS_DEBUG
@@ -229,6 +230,15 @@ void copy_endio(struct generic_callback *cb)
 
 	queue = mref_a->saved_queue;
 	index = mref_a->saved_index;
+	/* Validate both coordinates before looking up the state.  Error paths
+	 * below must also be safe when debug-only consistency checks fail.
+	 */
+	if (unlikely(index >= NR_COPY_REQUESTS || queue >= 2)) {
+		MARS_ERR("invalid copy callback index=%u queue=%u\n", index, queue);
+		error = -EINVAL;
+		goto exit;
+	}
+	st = _GET_STATE(brick, index);
 
 #ifdef CONFIG_MARS_DEBUG
 	/* index paranoia */
@@ -262,23 +272,12 @@ void copy_endio(struct generic_callback *cb)
 	}
 #endif
 
-	st = _GET_STATE(brick, index);
-
 	MARS_IO("queue=%u index=%u pos=%lld state=%d err=%d\n",
 		queue, index,
 		mref->ref_pos,
 		st->state,
 		cb->cb_error);
 
-	if (unlikely(queue >= 2)) {
-		MARS_ERR("bad queue %u at %px %px state=%d err=%d\n",
-			 queue,
-			 cb, mref_a,
-			 st->state,
-			 cb->cb_error);
-		error = -EINVAL;
-		goto exit;
-	}
 	old_mref = READ_ONCE(st->table[queue]);
 	if (unlikely(old_mref != mref)) {
 		MARS_ERR("table corruption at index=%u queue=%u: %px => %px state=%d err=%d\n",
@@ -303,11 +302,15 @@ void copy_endio(struct generic_callback *cb)
 	}
 
 exit:
+	trace_mars_request(brick->brick_path, "copy_complete", mref,
+			   mref->ref_pos, mref->ref_len, mref->ref_flags, error);
 	if (unlikely(error < 0)) {
-		WRITE_ONCE(st->error, error);
+		if (st)
+			WRITE_ONCE(st->error, error);
 		notify_clash(brick);
 	}
-	WRITE_ONCE(st->active[queue], false);
+	if (st)
+		WRITE_ONCE(st->active[queue], false);
 	if (mref->ref_flags & MREF_WRITE) {
 		atomic_dec(&brick->copy_write_flight);
 		atomic_dec(&global_copy_write_flight);
@@ -576,7 +579,7 @@ restart:
 		if (wait_for_requests_finished) {
 			/* Wait until old requests have vanished.
 			 */
-			if ((READ_ONCE(st->active[0]) |
+			if ((READ_ONCE(st->active[0]) ||
 			     READ_ONCE(st->active[1])) ||
 			    ((__u64)READ_ONCE(st->table[0]) |
 			     (__u64)READ_ONCE(st->table[1]))) {
@@ -599,7 +602,7 @@ restart:
 		/* This is the relgular starting state.
 		 * It must be zero, automatically entered via memset()
 		 */
-		if ((READ_ONCE(st->active[0]) |
+		if ((READ_ONCE(st->active[0]) ||
 		     READ_ONCE(st->active[1])) ||
 		    ((__u64)READ_ONCE(st->table[0]) |
 		     (__u64)READ_ONCE(st->table[1]))) {
@@ -942,7 +945,7 @@ int _run_copy(struct copy_brick *brick, loff_t this_start)
 		if (READ_ONCE(brick->is_aborting)) {
 			break;
 		}
-		if (READ_ONCE(st->active[0]) & READ_ONCE(st->active[1]))
+		if (READ_ONCE(st->active[0]) && READ_ONCE(st->active[1]))
 			break;
 
 		// call the finite state automaton
@@ -989,7 +992,7 @@ int _run_copy(struct copy_brick *brick, loff_t this_start)
 				break;
 			}
 			is_active =
-				(READ_ONCE(st->active[0]) |
+				(READ_ONCE(st->active[0]) ||
 				 READ_ONCE(st->active[1])) != 0;
 			if (is_active) {
 				break;

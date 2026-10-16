@@ -40,6 +40,7 @@ atomic_t client_receiver_count = ATOMIC_INIT(0);
 ///////////////////////// own type definitions ////////////////////////
 
 #include "mars_client.h"
+#include "mars_trace.h"
 
 #define CLIENT_HASH_MAX (PAGE_SIZE / sizeof(struct list_head))
 
@@ -136,6 +137,9 @@ void _kill_thread(struct client_threadinfo *ti, const char *name)
 static
 void _kill_channel(struct client_channel *ch)
 {
+	trace_mars_connection(ch->output->brick->brick_path,
+			      ch->output->bundle.host, ch->ch_nr,
+			      CL_CHANNEL_INITIALIZED, ch->recv_error);
 	MARS_DBG("channel = %px\n", ch);
 	if (mars_socket_is_alive(&ch->socket)) {
 		MARS_DBG("shutdown socket\n");
@@ -182,6 +186,8 @@ int _setup_channel(struct client_bundle *bundle, int ch_nr)
 	int status;
 
 	ch->ch_nr = ch_nr;
+	if (READ_ONCE(bundle->stopping))
+		return -ESHUTDOWN;
 	if (unlikely(ch->receiver.thread)) {
 		MARS_WRN("receiver thread %d unexpectedly not dead\n", ch_nr);
 		_kill_thread(&ch->receiver, "receiver");
@@ -216,6 +222,7 @@ int _setup_channel(struct client_bundle *bundle, int ch_nr)
 	ch->socket.s_recv_abort = mars_client_abort;
 	ch->ch_state = CL_CHANNEL_OPEN;
 
+	atomic_inc(&client_receiver_count);
 	ch->receiver.thread =
 		brick_thread_create(receiver_thread, ch,
 				    "mars_rcv%d.%d/%d",
@@ -223,14 +230,14 @@ int _setup_channel(struct client_bundle *bundle, int ch_nr)
 				    ch->thread_restart_count++,
 				    ch_nr);
 	if (unlikely(!ch->receiver.thread)) {
+		atomic_dec(&client_receiver_count);
 		MARS_ERR("cannot start receiver thread %d, status = %d\n", ch_nr, status);
 		mars_shutdown_socket(&ch->socket);
-		ch->ch_state = CL_CHANNEL_INITIALIZED;
-		status = -ENOENT;
+		/* Keep OPEN until _kill_channel drops the socket reference. */
+		status = -ENOMEM;
 		goto done;
 	}
 	ch->ch_state = CL_CHANNEL_USED;
-	atomic_inc(&client_receiver_count);
 
 done:
 	if (status < 0) {
@@ -248,7 +255,20 @@ really_done:
 static
 void _kill_bundle(struct client_bundle *bundle)
 {
+	struct client_output *output = container_of(bundle, struct client_output, bundle);
+	int i;
+
 	MARS_DBG("\n");
+	mutex_lock(&output->mutex);
+	WRITE_ONCE(bundle->stopping, true);
+	mutex_unlock(&output->mutex);
+	/* A sender may be blocked in socket I/O.  Wake it before joining it;
+	 * the sender retains ownership of channel teardown and receiver joins.
+	 */
+	for (i = 0; i < MAX_CLIENT_CHANNELS; i++)
+		mars_shutdown_socket(&bundle->channel[i].socket);
+	brick_wake_smp(&bundle->sender_event);
+	brick_wake_smp(&output->info_event);
 	_kill_thread(&bundle->sender, "sender");
 	_kill_all_channels(bundle);
 	bundle->bundle_state = CL_BUNDLE_INITIALIZED;
@@ -379,6 +399,9 @@ struct client_channel *_get_channel(struct client_bundle *bundle, int min_channe
 			goto done;
 		}
 		res->ch_state = CL_CHANNEL_CONNECTED;
+		trace_mars_connection(res->output->brick->brick_path,
+				      bundle->host, res->ch_nr,
+				      res->ch_state, 0);
 	}
 
 found:
@@ -416,6 +439,8 @@ int _setup_bundle(struct client_bundle *bundle, const char *str)
 	brick_string_free(bundle->path);
 
 	bundle->path = brick_strdup(str);
+	if (!bundle->path)
+		return -ENOMEM;
 
 	status = -EINVAL;
 	bundle->host = strchr(bundle->path, '@');
@@ -427,11 +452,15 @@ int _setup_bundle(struct client_bundle *bundle, const char *str)
 	*bundle->host++ = '\0';
 
 	bundle->last_thread_nr = get_human_nr(&global_numbers);
+	WRITE_ONCE(bundle->stopping, false);
+	atomic_inc(&client_sender_count);
 	bundle->sender.thread =
 		brick_thread_create(sender_thread, bundle,
 				    "mars_snd%d",
 				    bundle->last_thread_nr);
 	if (unlikely(!bundle->sender.thread)) {
+		atomic_dec(&client_sender_count);
+		WRITE_ONCE(bundle->stopping, true);
 		put_human_nr(&global_numbers, bundle->last_thread_nr);
 		MARS_ERR("cannot start sender thread for '%s' @%s\n",
 			 bundle->path,
@@ -439,8 +468,6 @@ int _setup_bundle(struct client_bundle *bundle, const char *str)
 		status = -ENOENT;
 		goto done;
 	}
-
-	atomic_inc(&client_sender_count);
 
 	status = 0;
 
@@ -466,6 +493,54 @@ long _compute_timeout(struct client_brick *brick, bool for_info)
 
 ////////////////// own brick / input / output operations //////////////////
 
+static bool client_valid_info(const struct mars_info *info)
+{
+	unsigned int logical, physical;
+
+	if (info->current_size < 0 || info->tf_align < 0 || info->tf_min_size < 0 ||
+	    (info->tf_align && !is_power_of_2(info->tf_align)) ||
+	    (info->tf_min_size && !is_power_of_2(info->tf_min_size)))
+		return false;
+	if (info->xf_logical_block_size &&
+	    (info->xf_logical_block_size < 512 || info->xf_logical_block_size > PAGE_SIZE ||
+	     !is_power_of_2(info->xf_logical_block_size)))
+		return false;
+	logical = info->xf_logical_block_size ?: max(512, info->tf_min_size);
+	if (info->xf_physical_block_size < 0 ||
+	    (info->xf_physical_block_size &&
+	     (!is_power_of_2(info->xf_physical_block_size) ||
+	      info->xf_physical_block_size < logical)))
+		return false;
+	physical = info->xf_physical_block_size ?: max_t(unsigned int, logical, info->tf_align);
+	if (info->xf_alignment_offset < 0 || info->xf_alignment_offset >= physical ||
+	    info->xf_io_min < 0 || info->xf_io_opt < 0 ||
+	    info->xf_io_min % logical || info->xf_io_opt % logical)
+		return false;
+	return (info->xf_discard_enabled == 0 || info->xf_discard_enabled == 1) &&
+	       (info->xf_write_same_capable == 0 || info->xf_write_same_capable == 1) &&
+	       (info->xf_nonrot == 0 || info->xf_nonrot == 1);
+}
+
+static int client_recv_info(struct client_output *output, struct client_channel *ch)
+{
+	/* Older peers omit extension fields. Never inherit them from a previous
+	 * connection, and never publish a partially decoded response.
+	 */
+	struct mars_info info = {};
+	int status = mars_recv_struct(&ch->socket, &info, mars_info_meta);
+
+	if (status <= 0)
+		return status ?: -EBADMSG;
+	if (!client_valid_info(&info))
+		return -EBADMSG;
+	mutex_lock(&output->mutex);
+	output->info = info;
+	WRITE_ONCE(output->got_info, true);
+	mutex_unlock(&output->mutex);
+	brick_wake_smp(&output->info_event);
+	return 0;
+}
+
 static int client_get_info(struct client_output *output, struct mars_info *info)
 {
 	struct client_brick *brick = output->brick;
@@ -474,7 +549,7 @@ static int client_get_info(struct client_output *output, struct mars_info *info)
 
 	if (!brick->power.led_on) {
 		if (output->got_info)
-			return 0;
+			goto timeout;
 		output->get_info = true;
 		brick_wake_smp(&output->bundle.sender_event);
 		goto timeout;
@@ -484,10 +559,12 @@ static int client_get_info(struct client_output *output, struct mars_info *info)
 	brick_wake_smp(&output->bundle.sender_event);
 	
 	brick_wait_smp(output->info_event,
-		       output->got_info,
+		       output->got_info || READ_ONCE(output->bundle.stopping) ||
+		       !READ_ONCE(brick->power.button),
 		       io_timeout * HZ);
 timeout:
-	status = -ETIME;
+	status = READ_ONCE(output->bundle.stopping) ? -ESHUTDOWN : -ETIMEDOUT;
+	mutex_lock(&output->mutex);
 	if (output->got_info) {
 		status = 0;
 		if (info) {
@@ -496,6 +573,7 @@ timeout:
 			output->get_info = true;
 		}
 	}
+	mutex_unlock(&output->mutex);
 	return status;
 }
 
@@ -591,9 +669,12 @@ void _hash_insert(struct client_output *output,
 	mutex_lock(&output->mutex);
 	if (refresh_completed)
 		mref_a->has_completed = false;
+	else if (mref_a->has_completed)
+		goto unlock;
 	__io_insert(output, mref_a);
 	__hash_insert(output, mref_a);
 	mb();
+unlock:
 	mutex_unlock(&output->mutex);
 }
 
@@ -608,19 +689,29 @@ static void client_ref_io(struct client_output *output, struct mref_object *mref
 		goto fatal;
 
 	while (brick->max_flying > 0 &&
-	       atomic_read(&brick->fly_count) > brick->max_flying) {
+	       atomic_read(&brick->fly_count) >= brick->max_flying) {
+		if (!READ_ONCE(brick->power.button) ||
+		    READ_ONCE(output->bundle.stopping))
+			goto error;
 		MARS_IO("sleeping request pos = %lld len = %d flags = %ux (flying = %d)\n",
 			mref->ref_pos, mref->ref_len, mref->ref_flags,
-			atomic_read(&output->fly_count));
-#ifdef IO_DEBUGGING
-		brick_msleep(3000);
-#else
-		brick_msleep(1000 * 2 / HZ);
-#endif
+			atomic_read(&brick->fly_count));
+		brick_wait_smp(output->bundle.sender_event,
+			       !READ_ONCE(brick->power.button) ||
+			       READ_ONCE(output->bundle.stopping) ||
+			       atomic_read(&brick->fly_count) < brick->max_flying,
+			       HZ);
 	}
 
-	if (!(brick->power.led_on & brick->power.button))
+	/* Serialize admission with shutdown: no request may appear after the
+	 * sender's final drain of the queue.
+	 */
+	mutex_lock(&output->mutex);
+	if (!(brick->power.led_on & brick->power.button) ||
+	    READ_ONCE(output->bundle.stopping)) {
+		mutex_unlock(&output->mutex);
 		goto error;
+	}
 
 	atomic_inc(&mars_global_io_flying);
 	atomic_inc(&brick->fly_count);
@@ -628,11 +719,16 @@ static void client_ref_io(struct client_output *output, struct mref_object *mref
 
 	mref_a->submit_jiffies = jiffies;
 
-	_hash_insert(output, mref_a, true);
+	mref_a->has_completed = false;
+	__io_insert(output, mref_a);
+	__hash_insert(output, mref_a);
+	mutex_unlock(&output->mutex);
+	trace_mars_request(brick->brick_path, "client_submit", mref,
+			   mref->ref_pos, mref->ref_len, mref->ref_flags, 0);
 
 	MARS_IO("added request id = %d pos = %lld len = %d flags = %ux (flying = %d)\n",
 		mref->ref_id, mref->ref_pos, mref->ref_len, mref->ref_flags,
-		atomic_read(&output->fly_count));
+		atomic_read(&brick->fly_count));
 
 	brick_wake_smp(&output->bundle.sender_event);
 
@@ -648,6 +744,7 @@ error:
 
  fatal:
 	MARS_ERR("FATAL error = %d\n", error);
+	SIMPLE_CALLBACK(mref, error);
 }
 
 static
@@ -763,6 +860,10 @@ int receiver_thread(void *data)
 					 output->bundle.host);
 				// try to consume the corresponding payload
 				mref = client_alloc_mref(output->brick);
+				if (!mref) {
+					status = -ENOMEM;
+					goto done;
+				}
 				status = mars_recv_cb(&ch->socket, mref, &cmd);
 				client_free_mref(mref);
 				goto done;
@@ -798,18 +899,21 @@ int receiver_thread(void *data)
 				MARS_DBG("ERROR %d\n", mref->_object_cb.cb_error);
 			}
 			if (!had_completed) {
+				atomic_dec(&brick->fly_count);
+				atomic_dec(&mars_global_io_flying);
+				brick_wake_smp(&output->bundle.sender_event);
+				trace_mars_request(brick->brick_path, "client_complete", mref,
+						   mref->ref_pos, mref->ref_len,
+						   mref->ref_flags, mref->_object_cb.cb_error);
 				SIMPLE_CALLBACK(mref, mref->_object_cb.cb_error);
 			}
 
 		has_finished:
 			client_ref_put(output, mref);
-
-			atomic_dec(&output->brick->fly_count);
-			atomic_dec(&mars_global_io_flying);
 			break;
 		}
 		case CMD_GETINFO:
-			status = mars_recv_struct(&ch->socket, &output->info, mars_info_meta);
+			status = client_recv_info(output, ch);
 			if (status < 0) {
 				MARS_WRN("got bad info from remote '%s' @%s, status = %d\n",
 					 output->bundle.path,
@@ -817,8 +921,6 @@ int receiver_thread(void *data)
 					 status);
 				goto done;
 			}
-			output->got_info = true;
-			brick_wake_smp(&output->info_event);
 			break;
 		default:
 			MARS_ERR("got bad command %d from remote '%s' @%s, terminating.\n",
@@ -835,6 +937,9 @@ int receiver_thread(void *data)
 			if (!ch->recv_error) {
 				MARS_DBG("signalling recv_error = %d\n", status);
 				ch->recv_error = status;
+				trace_mars_connection(brick->brick_path,
+						      output->bundle.host, ch->ch_nr,
+						      ch->ch_state, status);
 			}
 			brick_msleep(100);
 		}
@@ -860,13 +965,11 @@ static
 void _do_timeout(struct client_output *output, struct list_head *anchor, bool force)
 {
 	struct client_brick *brick = output->brick;
-	struct list_head *tmp;
-	struct list_head *prev;
+	LIST_HEAD(completed);
+	struct client_mref_aspect *mref_a, *next;
 	long io_timeout = _compute_timeout(brick, false);
+	unsigned int completed_count = 0;
 	int i;
-
-	if (list_empty(anchor))
-		return;
 
 	if (!mars_net_is_alive)
 		force = true;
@@ -892,17 +995,11 @@ void _do_timeout(struct client_output *output, struct list_head *anchor, bool fo
 	
 	mb();
 	mutex_lock(&output->mutex);
-	for (tmp = READ_ONCE(anchor->prev), prev = READ_ONCE(tmp->prev);
-	     tmp != anchor;
-	     tmp = prev, prev = READ_ONCE(tmp->prev)) {
-		struct client_mref_aspect *mref_a;
-		struct mref_object *mref;
-
-		mref_a = container_of(tmp, struct client_mref_aspect, io_head);
-		
+	list_for_each_entry_safe(mref_a, next, anchor, io_head) {
+		/* Re-submission can reorder requests, so every age must be checked. */
 		if (!force &&
 		    !time_is_before_jiffies(mref_a->submit_jiffies + io_timeout)) {
-			break;
+			continue;
 		}
 		/* Race compensation: skip already completed requests */
 		cond_resched();
@@ -911,22 +1008,32 @@ void _do_timeout(struct client_output *output, struct list_head *anchor, bool fo
 		
 		list_del_init(&mref_a->hash_head);
 		mref_a->is_hashed = false;
-		list_del_init(&mref_a->io_head);
+		list_move_tail(&mref_a->io_head, &completed);
 		mref_a->has_completed = true;
+		completed_count++;
+	}
+	mutex_unlock(&output->mutex);
+	atomic_sub(completed_count, &brick->fly_count);
+	atomic_sub(completed_count, &mars_global_io_flying);
+	brick_wake_smp(&output->bundle.sender_event);
 
-		mref = mref_a->object;
+	/* Callers may resubmit from their completion.  Never call a callback
+	 * while holding the queue mutex, and detach each request before it can
+	 * release its final reference.
+	 */
+	list_for_each_entry_safe(mref_a, next, &completed, io_head) {
+		struct mref_object *mref = mref_a->object;
+		int error = force ? -ESHUTDOWN : -ETIMEDOUT;
 
+		list_del_init(&mref_a->io_head);
 		atomic_inc(&brick->timeout_count);
-
-		SIMPLE_CALLBACK(mref, -ETIME);
+		trace_mars_request(brick->brick_path, "client_complete", mref,
+				   mref->ref_pos, mref->ref_len, mref->ref_flags, error);
+		SIMPLE_CALLBACK(mref, error);
 
 		client_ref_put(output, mref);
-
-		atomic_dec(&brick->fly_count);
-		atomic_dec(&mars_global_io_flying);
 	}
-	mb();
-	mutex_unlock(&output->mutex);
+	brick_wake_smp(&output->bundle.sender_event);
 }
 
 static
@@ -958,7 +1065,8 @@ static int sender_thread(void *data)
 		mars_limit_reset(&client_limiter);
 	atomic_inc(&brick->sender_count);
 
-        while (brick->power.button && !brick_thread_should_stop()) {
+        while (brick->power.button && !READ_ONCE(bundle->stopping) &&
+	       !brick_thread_should_stop()) {
 		struct list_head *tmp = NULL;
 		struct client_mref_aspect *mref_a;
 		struct mref_object *mref;
@@ -977,10 +1085,14 @@ static int sender_thread(void *data)
 				       mb();
 				       /* excpetional access outside of the mutex */
 				       !list_empty(&output->mref_list) ||
-					       output->get_info;
+					       output->get_info ||
+					       READ_ONCE(bundle->stopping) ||
+					       !READ_ONCE(brick->power.button);
 			       }),
 			       HZ);
 		mb();
+		if (READ_ONCE(bundle->stopping) || !READ_ONCE(brick->power.button))
+			break;
 
 		if (output->get_info) {
 			if (ch && old_cork) {
@@ -1027,6 +1139,10 @@ static int sender_thread(void *data)
 
 		mref_a = container_of(tmp, struct client_mref_aspect, io_head);
 		mref = mref_a->object;
+		/* Once it is placed on a channel, a receiver can complete it before
+		 * mars_send_mref() returns.  Keep the object alive through resubmission.
+		 */
+		_mref_get(mref);
 		mref_a->orig_ref_id = mref->ref_id;
 
 		/* Limiting is not inteded for production, only for testing */
@@ -1059,6 +1175,7 @@ static int sender_thread(void *data)
 			if (unlikely(!ch)) {
 				// notice: this will re-assign hash_head without harm
 				_hash_insert(output, mref_a, false);
+				client_ref_put(output, mref);
 				brick_msleep(1000);
 				continue;
 			}
@@ -1082,6 +1199,7 @@ static int sender_thread(void *data)
 		old_cork = cork;
 		if (unlikely(status < 0)) {
 			_hash_insert(output, mref_a, false);
+			client_ref_put(output, mref);
 			do_timeout = true;
 			ch = NULL;
 			// retry submission on next occasion..
@@ -1093,6 +1211,7 @@ static int sender_thread(void *data)
 			brick_msleep(100);
 			continue;
 		}
+		client_ref_put(output, mref);
 	}
 
 	if (unlikely(status < 0)) {
@@ -1151,8 +1270,6 @@ static int client_switch(struct client_brick *brick)
 		if (brick->power.led_off)
 			goto done;
 		mars_power_led_on((void*)brick, false);
-		if (atomic_read(&brick->sender_count))
-			goto done;
 		_kill_bundle(&output->bundle);
 		if (atomic_read(&brick->receiver_count))
 			goto done;
@@ -1242,6 +1359,8 @@ static int client_output_construct(struct client_output *output)
 	int i;
 
 	output->hash_table = brick_block_alloc(0, PAGE_SIZE);
+	if (!output->hash_table)
+		return -ENOMEM;
 
 	for (i = 0; i < CLIENT_HASH_MAX; i++) {
 		INIT_LIST_HEAD(&output->hash_table[i]);

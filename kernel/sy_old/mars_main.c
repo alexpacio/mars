@@ -52,12 +52,13 @@
 
 #include <linux/major.h>
 #include <linux/version.h>
-#if LINUX_VERSION_CODE < KERNEL_VERSION(7, 2, 0)
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 18, 0)
 #include <linux/genhd.h>
 #endif
 #include <linux/blkdev.h>
 
 #include "strategy.h"
+#include "../mars_net_validation.h"
 #include "../buildtag.h"
 #include "../brick_wait.h"
 #include "../lib_mapfree.h"
@@ -71,6 +72,7 @@
 #include "../mars_aio.h"
 #include "../mars_trans_logger.h"
 #include "../mars_if.h"
+#include "../mars_trace.h"
 #include "mars_proc.h"
 #ifdef CONFIG_MARS_DEBUG // otherwise currently unused
 #include "../mars_dummy.h"
@@ -993,7 +995,7 @@ int mars_mem_gb = 16;
 #define CONF_ALL_BATCHLEN 1
 #define CONF_ALL_PRIO   MARS_PRIO_NORMAL
 
-#define IF_SKIP_SYNC true
+#define IF_SKIP_SYNC false
 
 #define IF_MAX_PLUGGED 10000
 #define IF_READAHEAD 0
@@ -1985,6 +1987,7 @@ void _show_primary(struct mars_rotate *rot)
 	}
 	status = _show_actual(rot->parent_path, "is-primary", rot->is_primary);
 	if (rot->is_primary != rot->old_is_primary) {
+		trace_mars_role(rot->parent_path, rot->is_primary);
 		rot->old_is_primary = rot->is_primary;
 		mars_remote_trigger(MARS_TRIGGER_LOCAL | MARS_TRIGGER_TO_REMOTE);
 	}
@@ -3061,6 +3064,13 @@ int run_bone(struct mars_peerinfo *peer, struct mars_dent *remote_dent)
 #endif
 		}
 	} else if (S_ISLNK(remote_dent->new_stat.mode) && remote_dent->new_link) {
+		/* Apply the same mutation policy to pulled metadata and PUSH_LINK.
+		 * Local backing mappings and existing files are never replaced.
+		 */
+		if (!mars_net_link_mutable(remote_path, my_id()) ||
+		    !mars_net_link_target_valid(remote_dent->new_link) ||
+		    (stat_ok && !S_ISLNK(local_stat.mode)))
+			goto done;
 		/* is something in /mars/ips/ (or a guest membership) updated ? */
 		if ((!stat_ok ||
 		     lamport_time_compare(&remote_dent->new_stat.mtime,
@@ -3258,6 +3268,8 @@ int peer_action_dent_list(struct mars_peerinfo *peer,
 	MARS_DBG("fetching remote dentries from '%s' '%s'\n",
 		 peer->peer, paths);
 
+	if (!new_global)
+		return -ENOMEM;
 	status = mars_recv_dent_list(new_global, &peer->socket);
 	if (unlikely(status < 0))
 		goto free;
@@ -3413,9 +3425,13 @@ int peer_thread(void *data)
 			}
 		}
 	}
-	real_peer = path_make("%s:%d",
-			      peer->peer_ip ? peer->peer_ip : peer->peer,
-			      mars_net_default_port + MARS_TRAFFIC_META);
+	{
+		const char *address = peer->peer_ip ?: peer->peer;
+
+		real_peer = path_make(strchr(address, ':') && address[0] != '[' ?
+				      "[%s]:%d" : "%s:%d", address,
+				      mars_net_default_port + MARS_TRAFFIC_META);
+	}
 	MARS_INF("-------- %s peer thread starting on peer '%s' (%s)\n",
 		 peer->peer_ip,
 		 peer->peer, real_peer);
@@ -6435,6 +6451,10 @@ void _show_dev(struct mars_rotate *rot)
 {
 	struct if_brick *if_brick = rot->if_brick;
 	int open_count = 0;
+	struct trans_logger_brick *logger = rot->trans_brick;
+
+	__show_actual(rot->parent_path, "log-fatal-error",
+		      logger ? READ_ONCE(logger->fatal_error) : 0);
 
 	if (if_brick) {
 		_show_rate(rot, &if_brick->io_limiter, "if_rate");
@@ -6446,6 +6466,11 @@ void _show_dev(struct mars_rotate *rot)
 		__show_stamp(rot->parent_path, "if-completion-stamp",
 			     &if_brick->completion_stamp);
 		open_count = atomic_read(&if_brick->open_count);
+		__show_actual(rot->parent_path, "logical-block-size",
+			      max(512, if_brick->info.xf_logical_block_size ?: if_brick->info.tf_min_size));
+		__show_actual(rot->parent_path, "physical-block-size",
+			      max(512, if_brick->info.xf_physical_block_size ?: if_brick->info.tf_align));
+		_show_actual(rot->parent_path, "discard-supported", true);
 	}
 	_show_brick_status((void *)if_brick, rot->parent_path, "if");
 	__show_actual(rot->parent_path, "open-count", open_count);
@@ -8118,7 +8143,7 @@ static
 int init_global_mem(void)
 {
 	mars_global = alloc_mars_global();
-	return 0;
+	return mars_global ? 0 : -ENOMEM;
 }
 
 static
@@ -8152,14 +8177,8 @@ static void exit_main(void)
 	exit_say();
 #endif
 	printk(KERN_INFO "stopped MARS\n");
-	/* Workaround for nasty race: some kernel threads have not yet
-	 * really finished even _after_ kthread_stop() and may execute
-	 * some code which will disappear right after return from this
-	 * function.
-	 * A correct solution would probably need the help of the kernel
-	 * scheduler.
-	 */
-	brick_msleep(1000);
+	/* Subsystem exit functions join their kthreads and drain I/O callbacks. */
+	WARN_ON_ONCE(atomic_read(&mars_global_io_flying));
 	_mem_free(0);
 }
 

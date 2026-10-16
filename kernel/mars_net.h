@@ -31,7 +31,9 @@
 #include "brick.h"
 
 extern int mars_net_default_port;
+extern char *mars_listen_addr;
 extern bool mars_net_is_alive;
+extern bool mars_net_enabled(void);
 
 extern __u32 enabled_net_compressions;
 extern __u32 used_net_compression;
@@ -43,10 +45,11 @@ extern __u32 used_net_compression;
  * which cannot be neither encoded into usable_features_version
  * nor into usable_strategy_version.
  */
-#define MARS_PROTO_LEVEL 2
+#define MARS_PROTO_LEVEL 3
 
 #define MAX_FIELD_LEN   32
 #define MAX_DESC_CACHE  16
+#define MARS_NET_STRING_MAX (64 * 1024)
 
 struct mars_desc_cache {
 	u64   cache_sender_cookie;

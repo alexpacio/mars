@@ -1,0 +1,68 @@
+name: QEMU runtime checks (prepared runner)
+on:
+  workflow_dispatch:
+    inputs:
+      primary_kernel:
+        description: Installed kernel release on the disposable runner
+        required: true
+        type: string
+      secondary_kernel:
+        description: Second installed release for replication and rolling compatibility
+        required: true
+        type: string
+      sanitizer:
+        description: Require the selected primary kernel to contain this sanitizer
+        default: none
+        type: choice
+        options: [none, kasan, kcsan]
+permissions:
+  contents: read
+jobs:
+  qemu:
+    # Manual only: do not execute untrusted pull requests on a privileged runner.
+    runs-on: [self-hosted, linux, x64, mars-qemu]
+    timeout-minutes: 60
+    env:
+      PRIMARY_KERNEL: ${{ inputs.primary_kernel }}
+      SECONDARY_KERNEL: ${{ inputs.secondary_kernel }}
+      SANITIZER: ${{ inputs.sanitizer }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check selected kernel instrumentation
+        run: |
+          case "$PRIMARY_KERNEL:$SECONDARY_KERNEL" in *[!a-zA-Z0-9._+:-]*) exit 2;; esac
+          case "$SANITIZER" in
+            kasan) grep -qx CONFIG_KASAN=y "/lib/modules/$PRIMARY_KERNEL/build/.config" ;;
+            kcsan) grep -qx CONFIG_KCSAN=y "/lib/modules/$PRIMARY_KERNEL/build/.config" ;;
+          esac
+      - name: Single-node lifecycle, filesystem and discard checks
+        run: python3 test_suite/qemu/run.py "$PRIMARY_KERNEL" --workdir "$RUNNER_TEMP/mars-single-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" --timeout 900
+      - name: Network policy and malformed protocol inputs
+        run: python3 test_suite/qemu/run.py "$PRIMARY_KERNEL" --guest-script test_suite/qemu/network.sh --workdir "$RUNNER_TEMP/mars-network-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" --timeout 300
+      - name: WireGuard peer transport
+        run: python3 test_suite/qemu/run.py "$PRIMARY_KERNEL" --guest-script test_suite/qemu/wireguard.sh --extra-module wireguard --extra-binary wg --workdir "$RUNNER_TEMP/mars-wireguard-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" --timeout 300
+      - name: Backend I/O failure and teardown
+        run: python3 test_suite/qemu/run.py "$PRIMARY_KERNEL" --guest-script test_suite/qemu/faults.sh --extra-module dm_mod --extra-binary dmsetup --workdir "$RUNNER_TEMP/mars-data-fault-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" --timeout 900
+      - name: Transaction-log I/O failure and teardown
+        run: python3 test_suite/qemu/run.py "$PRIMARY_KERNEL" --guest-script test_suite/qemu/faults.sh --extra-module dm_mod --extra-binary dmsetup --append mars_fault=log --workdir "$RUNNER_TEMP/mars-log-fault-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" --timeout 900
+      - name: Abrupt-crash recovery
+        run: |
+          mkdir "$RUNNER_TEMP/mars-crash-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          TMPDIR="$RUNNER_TEMP/mars-crash-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" python3 test_suite/qemu/crash.py "$PRIMARY_KERNEL" --timeout 900
+      - name: Cross-version replication
+        run: python3 test_suite/qemu/replicate.py "$PRIMARY_KERNEL" "$SECONDARY_KERNEL" --workdir "$RUNNER_TEMP/mars-pair-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" --timeout 900
+      - name: Reverse cross-version replication
+        run: python3 test_suite/qemu/replicate.py "$SECONDARY_KERNEL" "$PRIMARY_KERNEL" --workdir "$RUNNER_TEMP/mars-reverse-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" --timeout 900
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: qemu-logs
+          path: |
+            ${{ runner.temp }}/mars-single-${{ github.run_id }}-${{ github.run_attempt }}/*.log
+            ${{ runner.temp }}/mars-pair-${{ github.run_id }}-${{ github.run_attempt }}/**/*.log
+            ${{ runner.temp }}/mars-reverse-${{ github.run_id }}-${{ github.run_attempt }}/**/*.log
+            ${{ runner.temp }}/mars-network-${{ github.run_id }}-${{ github.run_attempt }}/*.log
+            ${{ runner.temp }}/mars-wireguard-${{ github.run_id }}-${{ github.run_attempt }}/*.log
+            ${{ runner.temp }}/mars-data-fault-${{ github.run_id }}-${{ github.run_attempt }}/*.log
+            ${{ runner.temp }}/mars-log-fault-${{ github.run_id }}-${{ github.run_attempt }}/*.log
+            ${{ runner.temp }}/mars-crash-${{ github.run_id }}-${{ github.run_attempt }}/**/*.log

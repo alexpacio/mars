@@ -23,23 +23,31 @@ def main():
     parser.add_argument('--workdir', type=Path, help='new directory for images and logs')
     parser.add_argument('--prepare-only', action='store_true')
     parser.add_argument('--guest-script', type=Path, default=REPO / 'test_suite/qemu/guest.sh')
+    parser.add_argument('--module-source', type=Path, default=REPO,
+                        help='alternate source tree for mixed-version module tests')
     parser.add_argument('--append', default='', help='additional guest kernel arguments')
     parser.add_argument('--timeout', type=int, default=300)
     parser.add_argument('--accel', choices=('kvm', 'tcg'), default='kvm')
+    parser.add_argument('--logical-block-size', type=int, choices=(512, 4096), default=512)
+    parser.add_argument('--no-discard', action='store_true', help='test zero-write fallback')
+    parser.add_argument('--extra-module', action='append', default=[], help='additional guest kernel module and dependencies')
+    parser.add_argument('--extra-binary', action='append', default=[], help='additional guest executable and shared libraries')
     args = parser.parse_args()
     modules = Path('/lib/modules') / args.release
     kdir = modules / 'build'
-    work = args.workdir or Path(tempfile.mkdtemp(prefix='mars-qemu-'))
+    # Sparse metadata images still consume substantial space after mkfs. Avoid
+    # filling a RAM-backed /tmp and starving unrelated host applications.
+    work = args.workdir or Path(tempfile.mkdtemp(prefix='mars-qemu-', dir=os.environ.get('TMPDIR', '/var/tmp')))
     if args.workdir:
         work.mkdir(parents=True, exist_ok=False)
     work = work.resolve()
     print(f'Artifacts: {work}', flush=True)
     source = work / 'source'
     source.mkdir()
-    shutil.copytree(REPO / 'kernel', source / 'kernel', ignore=shutil.ignore_patterns(
+    shutil.copytree(args.module_source / 'kernel', source / 'kernel', ignore=shutil.ignore_patterns(
         '*.o', '*.ko', '*.cmd', '*.mod', '*.mod.c', 'Module.symvers',
         'modules.order', 'buildtag.h', 'mars_config.h'))
-    shutil.copytree(REPO / 'scripts', source / 'scripts')
+    shutil.copytree(args.module_source / 'scripts', source / 'scripts')
     config = (kdir / '.config').read_text()
     make = ['make', '-C', source / 'kernel', f'KDIR={kdir}', '-j8']
     if 'CONFIG_CC_IS_CLANG=y' in config:
@@ -77,12 +85,15 @@ def main():
     binaries = ('bash sh mount umount mountpoint hostname uname cat chmod mkdir ln readlink sleep '
                 'touch stat dd cmp sync rm mv cp dirname basename ls find grep sed awk sort head tail '
                 'cut tr date wc od timeout perl getent logger pstree ip '
-                'modprobe insmod rmmod lsmod mkfs.ext4 dmesg blockdev truncate sha256sum').split()
-    for binary in binaries:
+                'modprobe insmod rmmod lsmod mkfs.ext4 dmesg blockdev blkdiscard fstrim truncate sha256sum').split()
+    for binary in binaries + args.extra_binary:
         path = shutil.which(binary)
         if not path:
             raise RuntimeError(f'Missing prerequisite: {binary}')
         copy_binary(path)
+        if binary in args.extra_binary:
+            # Locally built helpers may live outside the guest's PATH.
+            shutil.copy2(path, root / 'usr/bin' / Path(binary).name)
     # marsadm uses only core Perl modules, including dynamically loaded extensions.
     inc = subprocess.check_output(['perl', '-MConfig', '-e',
                                    'print join("\n", @Config{qw(privlib archlib)})'], text=True)
@@ -102,7 +113,7 @@ def main():
     (root / 'usr/bin/marsadm').chmod(0o755)
     deps = subprocess.check_output(['modinfo', '-F', 'depends', str(source / 'kernel/mars.ko')], text=True).strip()
     for name in ['virtio_mmio', 'virtio_blk', 'virtio_net', 'ext4', 'crypto-crc32',
-                 *filter(None, deps.split(','))]:
+                 *filter(None, deps.split(',')), *args.extra_module]:
         result = subprocess.run(['modprobe', '--set-version', args.release, '--show-depends', name],
                                 text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         if result.returncode:
@@ -145,8 +156,11 @@ def main():
             '-append', 'console=ttyS0 rdinit=/init panic=-1 oops=panic loglevel=7 ' + args.append,
             '-netdev', 'user,id=net0', '-device', 'virtio-net-device,netdev=net0']
     for index, image in enumerate(images):
-        qemu += ['-drive', f'if=none,id=d{index},format=raw,file={image}',
-                 '-device', f'virtio-blk-device,drive=d{index}']
+        discard = 'ignore' if args.no_discard else 'unmap'
+        geometry = f',logical_block_size={args.logical_block_size},physical_block_size=4096' if index else ''
+        features = ',discard=off' if args.no_discard and index else ''
+        qemu += ['-drive', f'if=none,id=d{index},format=raw,file={image},discard={discard}',
+                 '-device', f'virtio-blk-device,drive=d{index}{geometry}{features}']
     (work / 'command.json').write_text(json.dumps([str(a) for a in qemu], indent=2))
     if args.prepare_only:
         return
